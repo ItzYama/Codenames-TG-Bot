@@ -1,0 +1,3953 @@
+import os
+import json
+import random
+import requests
+import httpx
+import asyncio
+import ssl
+from pymongo import MongoClient
+from google import genai
+import nltk
+from nltk.corpus import words
+import re
+import aiohttp
+from telegram.constants import ParseMode
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+import dns.resolver
+from telegram.ext import (
+    ApplicationBuilder, CallbackQueryHandler, CommandHandler, MessageHandler, MessageReactionHandler, ApplicationHandlerStop, ContextTypes, filters
+)
+from wordfreq import top_n_list
+
+def get_easy_words(n=25):
+    full_list = top_n_list('en', 5000)
+    easy_list = [w.upper() for w in full_list if 4 <= len(w) <= 8 and w.isalpha()]
+    return random.sample(easy_list, n)
+
+TOKEN = os.getenv("TOKEN")
+GEMINI_API_KEY = "AIzaSyCYpm-RIIu1pYvShGG5x3CIQjdZum3gAxE"
+
+MIN_PLAYERS = 4
+MAX_PLAYERS = 20
+BIG_WORD_POOL = top_n_list("en", 5000)
+
+nltk_data_path = os.path.join(os.getcwd(), 'nltk_data')
+if nltk_data_path not in nltk.data.path:
+    nltk.data.path.append(nltk_data_path)
+
+try:
+    nltk.data.find('corpora/words')
+except LookupError:
+    nltk.download('words', download_dir=nltk_data_path, quiet=True)
+
+ENGLISH_WORDS = [w.upper() for w in words.words() if len(w) >= 3 and len(w) <= 8 and w.isalpha()]
+
+games = {}
+
+HINDI_BLACKLIST = [
+    # Nature & Space
+    "suraj", "chand", "tara", "aasman", "badal", "barish", "dhund", "kohra", "dhua", "aag", 
+    "pani", "hawa", "dharti", "zamin", "ret", "mitti", "pathar", "pahad", "choti", "ghati", 
+    "nadi", "samundar", "sagar", "lehar", "talab", "jheel", "jharna", "ped", "poda", "patti", 
+    "tahni", "jad", "phool", "kali", "ghas", "jungle", "van", "registan", "dweep", "antariksh",
+
+    # Animals & Insects
+    "kutta", "pilla", "billi", "sher", "bagh", "cheeta", "hathi", "ghoda", "gadha", "unt", 
+    "bhains", "gaay", "bakri", "bhed", "suar", "bandar", "langur", "bhalu", "lomdi", "loha",
+    "chuha", "khargosh", "hiranya", "saanp", "chipkali", "mendak", "machli", "magarmach", 
+    "kachua", "panchi", "parinda", "chidiya", "kabutar", "tota", "ullu", "murgi", "batak", 
+    "makkhi", "machar", "titli", "makdi", "saanp", "zeher", "nevala", "chuha",
+
+    # Human & Body Parts
+    "insan", "aadmi", "aurat", "bacha", "buddha", "jawan", "ladka", "ladki", "dost", "yaar", 
+    "dushman", "padosi", "mehman", "maa", "baap", "bhai", "behen", "beta", "beti", "pati", 
+    "patni", "raja", "rani", "mantri", "sipahi", "chor", "pulis", "doctor", "vakeel", "kalam",
+    "aankh", "naak", "kaan", "muh", "jeeb", "daant", "chehra", "sar", "baal", "haath", "pair", 
+    "ungli", "dil", "dimag", "khoon", "haddi", "khal", "pet", "kamar", "gardan",
+
+    # Objects & Tools
+    "kalam", "kitab", "kagaz", "mez", "kursi", "ghadi", "chashma", "aina", "shisha", "paisa", 
+    "sikka", "not", "thaila", "basta", "kapda", "juta", "moza", "topi", "chhatri", "tala", 
+    "chabi", "mobile", "phone", "bijli", "tarak", "pankha", "roshni", "bulb", "mombatti", 
+    "kanta", "chamach", "bartan", "thali", "glass", "katori", "mez", "takiya", "chadar", 
+    "parda", "khidki", "darwaza", "diwar", "chhat", "farsh", "seedhi", "talwar", "bandook", 
+    "goli", "bam", "teer", "kaman", "loha", "sona", "chandi", "tambaa", "peetal", "heera",
+
+    # Food & Items
+    "khana", "pina", "pani", "doodh", "chai", "coffee", "cheeni", "namak", "mirch", "masala", 
+    "roti", "chawal", "daal", "sabzi", "phal", "seb", "kela", "aam", "ungoor", "santra", 
+    "anar", "nariyal", "anda", "maans", "mithai", "tel", "ghee", "makkhan", "paneer",
+
+    # Places & Transport
+    "ghar", "kamra", "rasoi", "shahar", "gaon", "desh", "videsh", "duniya", "rasta", "sadak", 
+    "gali", "chowk", "pull", "nadi", "khet", "bagicha", "maidan", "school", "college", 
+    "aspataal", "thana", "mandir", "masjid", "gadi", "car", "bus", "truck", "cycle", "jahaj", 
+    "vimaan", "noka", "patari", "rail", "station", "airport", "hotel", "dukan", "bazar",
+
+    # Actions & States
+    "jeet", "haar", "khel", "kaam", "naam", "pyar", "nafrat", "gussa", "shanti", "shor", 
+    "maut", "zindagi", "neend", "sapna", "subah", "raat", "dopahar", "shaam", "waqt", 
+    "samay", "sahi", "galat", "sach", "jhooth", "tez", "dheere", "garam", "thanda", 
+    "meetha", "kadwa", "khata", "namkeen", "hansna", "rona", "khush", "dukhi", "bhari", 
+    "halka", "narm", "sakht", "saaf", "ganda", "naya", "purana", "amir", "gareeb", 
+    "mushkil", "aasaan", "andhera", "ujala", "pehchan", "dekho", "shyad", "idhar", 
+    "udhar", "maro", "bacho", "daudo", "chalo", "baitho", "utho", "khao", "pio",
+
+    # Colors & Directions
+    "lal", "neela", "hara", "peela", "safed", "kala", "gulabi", "baingani", "narangi", 
+    "bhoora", "uupar", "neeche", "aage", "piche", "daye", "baaye", "seedha", "ulta", 
+    "andar", "bahar", "paas", "door", "beech", "kona", "gol", "lamba", "chota", "mota", "patla",
+
+    # Emotions & Mind
+    "soch", "fikr", "himmat", "bharosa", "shak", "umeed", "dhokha", "sabar", "himmat", "himayat",
+    "badla", "ehsas", "sharam", "garv", "khushi", "gham", "bechaini", "sakoon", "lalach", "jalan",
+    "hoshyar", "pagal", "bevkuf", "samajhdar", "nadan", "ziddi", "masoom", "shaitan", "bhola",
+
+    # Relations & Society
+    "rishta", "nata", "pariwar", "khandan", "aulaad", "buzurg", "saathi", "dushmani", "dosti",
+    "guru", "chela", "malik", "naukar", "mazdoor", "kisan", "grahak", "janata", "neta", "sarkar",
+    "adalat", "faisla", "kanoon", "jurm", "saza", "insaaf", "gawah", "saboot", "khabri",
+
+    # Daily Activities & Verbs
+    "sochna", "bolna", "sunna", "dekhna", "likhna", "parhna", "samajhna", "yaad", "bhool", "mili",
+    "khona", "pana", "dena", "lena", "bechna", "kharedna", "rokna", "chodna", "pakadna", "ladna",
+    "jeetni", "harna", "marna", "bachana", "phenkna", "uthana", "girna", "rakhna", "hatana",
+
+    # Abstract Concepts
+    "kismat", "naseeb", "taqat", "kamzori", "izzat", "zillat", "shohrat", "daulat", "garibi",
+    "tarakki", "rukawat", "koshish", "mehnat", "kamayabi", "nakamyabi", "azadi", "ghulami",
+    "aadti", "adat", "fitrat", "asli", "nakli", "gehra", "uncha", "neecha", "sasta", "mehenga",
+
+    # Miscellaneous Daily items
+    "batti", "dhaga", "rassa", "kila", "khamba", "dibba", "tokri", "jhulha", "chimta", "belan",
+    "kadai", "suji", "maida", "attt", "tel", "sabun", "kanghi", "sheesha", "bistar", "takht",
+    "sandook", "potli", "lifafa", "chithi", "khabar", "akhbar", "tohfa", "inam", "karz",
+
+    # Time & Measure
+    "kal", "aaj", "parso", "hafta", "mahina", "saal", "sadi", "lamha", "pal", "ghanta", "minute",
+    "vazan", "lamba", "chauda", "oonchai", "gehrai", "faasla", "durie", "raftaar", "vazan"
+]
+
+SHOP_ITEMS = {
+    "1": {"name": "🔍 Intel Lens", "price": 1000, "desc": "Reveals One Random Neutral Word To You ⚡"},
+    "2": {"name": "🛡️ Body Armor", "price": 5000, "desc": "One-time Protection From Assassin (Game Won't End) ⚡"},
+    "3": {"name": "🕵️ Spy Eye", "price": 2000, "desc": "Shows You The Identity Of Any 1 Word Without Revealing It ⚡"},
+    "4": {"name": "⚡ Extra Move", "price": 500, "desc": "Gives Your Team +1 Move In The Current Turn ⚡"},
+    "5": {"name": "💰 Coin Multiplier", "price": 500, "desc": "Double The Coins If Your Team Wins This Game ⚡"}
+}
+
+client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+
+def get_ai_clue(prompt):
+    response = client.models.generate_content(
+        model="gemini-1.5-flash",
+        contents=prompt
+    )
+    return response.text
+
+MONGO_URL = "mongodb+srv://bhawanishekhawat960_db_user:RFaCGKzJM3A7QtMh@cluster090.s9yqyc9.mongodb.net/?appName=Cluster090"
+
+client = MongoClient(
+    MONGO_URL,
+    tls=True,
+    tlsAllowInvalidCertificates=True
+)
+
+db = client['codenames_db']
+collection = db['user_stats']
+
+def load_stats():
+    stats = {}
+    try:
+        for doc in collection.find():
+            uid = doc.get('_id')
+            
+            if uid == "broadcast_list":
+                continue
+                
+            try:
+                stats[int(uid)] = doc.get('data', {
+                    "coins": 0, 
+                    "wins": 0, 
+                    "inventory": []
+                })
+            except (ValueError, TypeError):
+                continue
+                
+        print(f"✅ Data Loaded From MongoDB: {len(stats)} Players Synced!")
+    except Exception as e:
+        print(f"❌ Error Loading Stats: {e}")
+    
+    return stats
+
+def save_stats_to_db(uid):
+    if uid in user_stats:
+        try:
+            collection.update_one(
+                {'_id': str(uid)}, 
+                {'$set': {'data': user_stats[uid]}}, 
+                upsert=True
+            )
+        except Exception as e:
+            print(f"❌ Error Saving To DB: {e}")
+
+user_stats = load_stats()
+
+async def sync_user_to_db(user_id):
+    if user_id in user_stats:
+        collection.update_one(
+            {"_id": user_id},
+            {"$set": user_stats[user_id]},
+            upsert=True
+        )
+
+async def give_rewards(game, winning_team):
+    for p in game["teams"][winning_team]:
+        uid = p.id if hasattr(p, 'id') else p
+        
+        reward = 500
+        if uid in user_stats:
+            user_stats[uid]["coins"] += reward
+        else:
+            user_stats[uid] = {"coins": reward, "wins": 1, "name": "Agent"}
+            
+        await sync_user_to_db(uid)
+
+async def error_handler(update, context):
+    if "Message to be replied not found" in str(context.error):
+        return
+    print(f"Update {update} caused error {context.error}")
+
+# ---------------- Helpers ----------------
+
+def uname(u):
+    return f"@{u.username}" if u.username else u.first_name
+
+def board_view(board, user_id=None, game=None):
+    if not board:
+        return "<code>⚠️ System Error: Battle Map Data Corrupted...</code>"
+
+    rows, current_row = [], []
+    show_roles = False
+
+    if game and user_id is not None:
+        for team, spymaster in game.get("spymasters", {}).items():
+            sid = spymaster.id if hasattr(spymaster, 'id') else spymaster
+            if sid == user_id:
+                show_roles = True
+                break
+
+    emoji_map = {"BJP": "🪷", "Congress": "🪬", "Neutral": "🍁", "Assassin": "🏴‍☠️"}
+
+    final_board = "" 
+
+    for i, (w, d) in enumerate(board.items(), 1):
+        word_text = w.title()
+        role = d.get('role', d.get('team', 'Neutral'))
+        emoji = emoji_map.get(role, "🍁")
+
+        if show_roles:
+            current_row.append(f"<b>{emoji} {word_text}</b>")
+        else:
+            if d.get("revealed", False):
+                current_row.append(f"<b>{emoji} {word_text}</b>")
+            else:
+                current_row.append(f"📦 <code>{word_text}</code>")
+
+        if i % 3 == 0:
+            rows.append(" | ".join(current_row))
+            current_row = []
+
+    if current_row:
+        rows.append(" | ".join(current_row))
+
+    final_board += "\n".join(rows)
+    
+    if not show_roles:
+        final_board += f"\n\n🛰️ <i>Status: Use /Guess To Strike A Target.</i>"
+    
+    return final_board
+
+async def send_winner_image(context, chat_id, winner_team):
+    if winner_team == "BJP":
+        photo_path = "bjp_win.jpg"
+    elif winner_team == "Congress":
+        photo_path = "congress_win.jpg"
+    else:
+        return
+
+    with open(photo_path, "rb") as photo:
+        await context.bot.send_photo(chat_id=chat_id, photo=photo)
+
+async def send_start_image(context, chat_id, reply_to_id=None):
+    Photo_Path = "startgame.jpg" 
+    
+    try:
+        with open(Photo_Path, "rb") as Photo:
+            await context.bot.send_photo(
+                chat_id=chat_id, 
+                photo=Photo,
+                reply_to_message_id=reply_to_id
+            )
+    except FileNotFoundError:
+        print(f"Error: {Photo_Path} not found!")
+    except Exception as e:
+        print(f"Error In send_start_image: {e}")
+
+async def send_wrong_image(context, chat_id, reply_to_id):
+    Photo_Path = "wrong.jpg" 
+    Caption_Text = "<b>Shit Again 🫩🙆🏻‍♂️</b>"
+
+    try:
+        with open(Photo_Path, "rb") as Photo:
+            await context.bot.send_photo(
+                chat_id=chat_id, 
+                photo=Photo, 
+                caption=Caption_Text,
+                reply_to_message_id=reply_to_id,
+                parse_mode="HTML"
+            )
+    except FileNotFoundError:
+        await context.bot.send_message(chat_id=chat_id, text=Caption_Text, reply_to_message_id=reply_to_id, parse_mode="HTML")
+    except Exception as e:
+        print(f"Error In Send_Wrong_Image: {e}")
+
+async def send_fak_image(context, chat_id, reply_to_id):
+    photo_path = "fak.jpg" 
+    caption_text = "Fak You B!tch A$$ Niegga 🖕🏻"
+
+    try:
+        with open(photo_path, "rb") as photo:
+            await context.bot.send_photo(
+                chat_id=chat_id, 
+                photo=photo, 
+                caption=caption_text,
+                reply_to_message_id=reply_to_id
+            )
+    except FileNotFoundError:
+        await context.bot.send_message(chat_id=chat_id, text=caption_text, reply_to_message_id=reply_to_id)
+    except Exception as e:
+        print(f"Error in send_fak_image: {e}")
+
+async def send_lmao_image(context, chat_id, reply_to_id):
+    Photo_Path = "lmao.jpg" 
+    Caption_Text = "Lmao 😂🤣😂🤣😂"
+
+    try:
+        with open(Photo_Path, "rb") as Photo:
+            await context.bot.send_photo(
+                chat_id=chat_id, 
+                photo=Photo, 
+                caption=Caption_Text,
+                reply_to_message_id=reply_to_id
+            )
+    except FileNotFoundError:
+        await context.bot.send_message(chat_id=chat_id, text=Caption_Text, reply_to_message_id=reply_to_id)
+    except Exception as e:
+        print(f"Error In Send_Lmao_Image: {e}")
+
+async def send_suicide_image(context, chat_id, reply_to_id):
+    Photo_Path = "suicide.jpg" 
+    Caption_Text = "<b>You Should Do This 🥀🥀</b>"
+
+    try:
+        with open(Photo_Path, "rb") as Photo:
+            await context.bot.send_photo(
+                chat_id=chat_id, 
+                photo=Photo, 
+                caption=Caption_Text,
+                reply_to_message_id=reply_to_id,
+                parse_mode="HTML"
+            )
+    except FileNotFoundError:
+        await context.bot.send_message(chat_id=chat_id, text=Caption_Text, reply_to_message_id=reply_to_id, parse_mode="HTML")
+    except Exception as e:
+        print(f"Error In Send_Suicide_Image: {e}")
+
+async def send_black_image(context, chat_id, reply_to_id):
+    Photo_Path = "black.jpg" 
+    Caption_Text = "<b>You Deserve To Get Touched By Them 😍</b>"
+
+    try:
+        with open(Photo_Path, "rb") as Photo:
+            await context.bot.send_photo(
+                chat_id=chat_id, 
+                photo=Photo, 
+                caption=Caption_Text,
+                reply_to_message_id=reply_to_id,
+                parse_mode="HTML"
+            )
+    except FileNotFoundError:
+        await context.bot.send_message(chat_id=chat_id, text=Caption_Text, reply_to_message_id=reply_to_id, parse_mode="HTML")
+    except Exception as e:
+        print(f"Error In Send_Black_Image: {e}")
+
+async def send_dena_image(context, chat_id, reply_to_id):
+    photo_path = "dena.jpg" 
+    caption_text = ("You Right Now: 🤣😂🥀🥀")
+
+    try:
+        with open(photo_path, "rb") as photo:
+            await context.bot.send_photo(
+                chat_id=chat_id, 
+                photo=photo, 
+                caption=caption_text,
+                reply_to_message_id=reply_to_id,
+                parse_mode="HTML"
+            )
+    except FileNotFoundError:
+        await context.bot.send_message(
+            chat_id=chat_id, 
+            text="🚨 <b>IMAGE MISSING:</b>\n" + caption_text, 
+            reply_to_message_id=reply_to_id, 
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        print(f"Error In Send_Dena_Image: {e}")
+
+async def send_right_image(context, chat_id, reply_to_id):
+    Photo_Path = "right.jpg" 
+    Caption_Text = "<b>Good Job 👍🏻🫡</b>"
+
+    try:
+        with open(Photo_Path, "rb") as Photo:
+            await context.bot.send_photo(
+                chat_id=chat_id, 
+                photo=Photo, 
+                caption=Caption_Text,
+                reply_to_message_id=reply_to_id,
+                parse_mode="HTML"
+            )
+    except FileNotFoundError:
+        await context.bot.send_message(chat_id=chat_id, text=Caption_Text, reply_to_message_id=reply_to_id, parse_mode="HTML")
+    except Exception as e:
+        print(f"Error In Send_Right_Image: {e}")
+
+def get_achievement_title(data):
+    wins = data.get("wins", data.get("win", 0))
+    coins = data.get("coins", 0)
+    
+    if wins >= 100: return "🎖️ Ultimate Spymaster"
+    elif wins >= 50: return "🥇 Master Detective"
+    elif wins >= 25: return "🥈 Professional Agent"
+    elif wins >= 10: return "🥉 Senior Operative"
+    elif wins >= 5: return "🏅 Sharp Intelligence"
+    elif coins < 0: return "📉 Bankrupt Informant"
+    else: return "🔰 New Recruit"
+
+    new_title = get_achievement_title(data)
+    collection.update_one({"_id": uid}, {"$set": {"title": new_title}})
+
+def reset_all_votes(game):
+    """/Guess Waale Votes Ko Memory Se Poori Tarah Saaf Karne Ke Liye"""
+    if "votes" in game:
+        game["votes"].clear()
+    else:
+        game["votes"] = {}
+        
+    if "voted_users" in game:
+        game["voted_users"].clear()
+    else:
+        game["voted_users"] = []
+    
+    if "board" in game and isinstance(game["board"], dict):
+        for word in game["board"]:
+            if isinstance(game["board"][word], dict):
+                if "votes" in game["board"][word]:
+                    game["board"][word]["votes"].clear()
+                else:
+                    game["board"][word]["votes"] = []
+                    
+    game["vote_in_progress"] = False  
+    game["last_vote_message_id"] = None
+    
+def switch(team):
+    return "Congress" if team == "BJP" else "BJP"
+
+def generate_board():
+    selected_words = get_easy_words(25)
+    
+    board = {}
+    indices = list(range(25))
+    random.shuffle(indices)
+    
+    bjp_idx = indices[:8]         # 8 Words For BJP
+    con_idx = indices[8:16]       # 8 Words For Congress
+    assassin_idx = indices[16:17] # 1 Assassin Word
+    civilian_idx = indices[17:]   # 8 Neutral Words
+
+    for i in range(25):
+        word = selected_words[i]
+        if i in bjp_idx: team = "BJP"
+        elif i in con_idx: team = "Congress"
+        elif i in assassin_idx: team = "Assassin"
+        else: team = "Neutral"
+        
+        board[word] = {"team": team, "revealed": False}
+    
+    return board
+
+# ---------------- Commands ----------------
+
+async def delete_command(msg):
+    if msg.text and msg.text.startswith("/"):
+        try:
+            await msg.delete()
+        except:
+            pass
+
+async def startgame(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type == "private":
+        off_limits_msg = (
+            "❌ <b>Access Restricted</b>\n\n"
+            "📢 <b>Notice:</b>\n"
+            "Game Operations Are Only Authorized Within <b>Groups</b>.\n\n"
+            "📡 <i>System: Please Start The Game In A Group.</i>"
+        )
+        await update.message.reply_text(off_limits_msg, parse_mode="HTML")
+        return
+
+    chat_id = update.effective_chat.id  
+    user = update.effective_user
+    
+    
+    if chat_id in games and games[chat_id]["active"]:  
+        rejected_msg = (
+            "⚠️ <b>Session Already Active</b>\n\n"
+            "🚨 <b>Command Error:</b>\n"
+            "A Game Is Already Running In This Group!\n\n"
+            "💡 <b>Advisory:</b>\n"
+            "Finish The Current Match Or Use <code>/cancel</code> To Reset.\n\n"
+            "⚡ <i>Status: Table Occupied.</i>"
+        )
+        await update.message.reply_text(rejected_msg, parse_mode="HTML")  
+        return
+      
+    games[chat_id] = {  
+        "players": {},  
+        "teams": {"BJP": [], "Congress": []},  
+        "spymasters": {},  
+        "board": None,  
+        "turn": None,  
+        "clue": None,  
+        "left": 0,  
+        "active": True,  
+        "started": False,
+        "starter_id": update.effective_user.id,
+        "creator": user.id,
+        "timer_task": None,
+        "spy_timer": 60,
+        "player_timer": 60,
+        "spy_timer_active": False,
+        "player_timer_active": False
+    }
+    
+    try:
+        collection.update_one(
+            {"_id": "broadcast_list"}, 
+            {"$addToSet": {"chat_ids": chat_id}}, 
+            upsert=True
+        )
+    except Exception as e:
+        print(f"DB Broadcast Error: {e}")
+        
+    start_msg = (
+        f"🎮 <b>Mission: Ultimate Codenames</b>\n\n"
+        f"👑 <b>Game Creator:</b> {user.first_name}\n"
+        f"📢 <b>Current Status:</b> 🟢 Recruitment Phase Open\n\n"
+        f"Two Elite Teams Compete In A Game Of Intelligence And Mystery Words:\n\n"
+        f"🪷 <b>Team BJP</b> vs 🪬 <b>Team Congress</b>\n\n"
+        f"👉 <b>How To Join:</b> Type <code>/join</code> Now!\n"
+        f"👥 <b>Live Roster:</b> Check Status With <code>/players</code>\n\n"
+        f"⚠️ <b>Requirement:</b>\n"
+        f"Minimum: <b>4</b> | Maximum: <b>20</b> Players Needed.\n\n"
+        f"🧩 <i>Are You Ready To Decode The Board?</i>\n\n"
+        f"🛠️ <b>System Architect:</b> @bhawanisinghshekhawatt"
+    )
+    await update.message.reply_text(start_msg, parse_mode="HTML") 
+    await send_start_image(context, chat_id)
+    
+    try: await update.message.delete()
+    except: pass
+
+async def join(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    game = games.get(chat_id)
+    u = update.effective_user
+    
+    if game and u.id in game["players"]:
+        already_msg = (
+            "🚩 <b>Position Secured</b>\n\n"
+            f"🕵️ <b>Agent:</b> <u>{uname(u)}</u>\n"
+            "You Are Already Registered In This Game Lobby!\n\n"
+            "⚡ <i>Status: Ready For Intel.</i>"
+        )
+        await context.bot.send_message(chat_id=chat_id, text=already_msg, parse_mode="HTML")
+        return
+      
+    if not game or not game["active"] or game.get("started"):
+        denied_msg = (
+            "🚫 <b>Registration Closed</b>\n\n"
+            "🚨 <b>Access Denied:</b>\n"
+            "The Lobby Is Closed Or The Game Has Already Started!\n\n"
+            "📡 <i>System: Late Entry Protocols Not Authorized.</i>"
+        )
+        await context.bot.send_message(chat_id=chat_id, text=denied_msg, parse_mode="HTML")
+        return
+      
+    try:
+        dm_msg = (
+            "✅ <b>Connection Established</b>\n\n"
+            "📡 <b>Secure Channel Opened</b>\n\n"
+            f"Agent <b>{uname(u)}</b>, You Have Successfully Joined The Lobby.\n"
+            "All Secret Word Intel Will Be Transmitted Here.\n\n"
+            "🛡️ <i>Status: Encrypted And Secure.</i>"
+        )
+        await context.bot.send_message(chat_id=u.id, text=dm_msg, parse_mode="HTML")
+    except:
+        fail_msg = (
+            "⚠️ <b>Connection Failed</b>\n\n"
+            f"👤 <b>Agent:</b> <u>{uname(u)}</u>\n"
+            "The System Cannot Establish A Secure Private Link.\n\n"
+            "👉 <b>Action Required:</b>\n"
+            f"Please <b>Start</b> The Bot In Private (@{context.bot.username}) \n"
+            "First To Receive Secret Word Briefings!\n\n"
+            "📡 <i>System: Handshake Protocol Failed.</i>"
+        )
+        await context.bot.send_message(chat_id=chat_id, text=fail_msg, parse_mode="HTML")
+        return
+      
+    game["players"][u.id] = u  
+    collection.update_one({"_id": u.id}, {"$set": {"name": uname(u)}}, upsert=True)
+    
+    success_msg = (
+        "✅ <b>Agent Registered</b>\n\n"
+        f"👤 <b>Name:</b> <u>{uname(u)}</u>\n"
+        "📡 <b>Data:</b> Profile Verification Complete.\n"
+        "🎮 <b>Status:</b> Added To The Active Mission.\n\n"
+        "⚡ <i>System: Member Deployment Successful.</i>"
+    )
+    
+    await context.bot.send_message(chat_id=chat_id, text=success_msg, parse_mode="HTML")
+    try: await update.message.delete()
+    except: pass
+
+async def players(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    Chat_Id = update.effective_chat.id
+    Game = games.get(Chat_Id)
+    
+    if not Game or not Game.get("players"):
+        ghost_msg = (
+            "🌑 <b>Mission Status: Empty Lobby</b>\n\n"
+            "📡 <b>Scanning... No Agents Found!</b>\n\n"
+            "The Game Lobby Is Currently Empty. No \n"
+            "Agents Have Joined This Session Yet.\n\n"
+            "👉 <b>Action Required:</b>\n"
+            "Use <code>/Join</code> To Authorize Your Entry!\n\n"
+            "⚠️ <i>Status: Waiting For Participants.</i>"
+        )
+        await context.bot.send_message(chat_id=Chat_Id, text=ghost_msg, parse_mode="HTML")
+        return
+      
+    player_names = []
+    for u in Game["players"].values():
+        player_names.append(f"• <b>{uname(u)}</b>")
+    
+    player_list = "\n".join(player_names)
+    
+    player_list_msg = (
+        "👥 <b>Active Mission Roster</b>\n\n"
+        "📡 <b>Agent Database Retrieved:</b>\n\n"
+        f"{player_list}\n\n"
+        f"📊 <b>Total Capacity:</b> <code>{len(Game['players'])}</code> Agents\n"
+        f"⚡ <b>Current Status:</b> Ready For Assignment\n\n"
+        "<i>Waiting For The Game Creator To Start...</i>\n\n"
+        "📡 <i>System: Roster Synchronization Complete.</i>"
+    )
+
+    try:
+        await context.bot.send_message(
+            chat_id=Chat_Id, 
+            text=player_list_msg, 
+            parse_mode="HTML"
+        )
+        
+        await update.message.delete()
+    except Exception as e:
+        print(f"Players Command Error: {e}")
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    game = games.get(chat_id)
+    user = update.effective_user
+    
+    if not game or not game.get("active") or game.get("started"):
+        return
+      
+    if user.id != game["creator"]:
+        denied_msg = (
+            "❌ <b>Access Denied</b>\n\n"
+            "🚨 <b>Authorization Failed:</b>\n"
+            "Only The <b>Game Creator</b> Has The \n"
+            "Permissions To Initiate This Session.\n\n"
+            "⚡ <i>System: Command Override Rejected.</i>"
+        )
+        await update.message.reply_text(denied_msg, parse_mode="HTML")
+        return
+
+    plist = list(game["players"].values())
+    
+    if len(plist) < MIN_PLAYERS:
+        fallback_msg = (
+            "⚠️ <b>Requirement Not Met</b>\n\n"
+            "🚨 <b>Action Required:</b>\n"
+            f"Need At Least <b>{MIN_PLAYERS}</b> Players To Start The Game.\n\n"
+            f"📊 <b>Current Players:</b> <code>{len(plist)}</code> Agents\n\n"
+            "📡 <i>System: Deployment Halted. Need More Participants.</i>"
+        )
+        await update.message.reply_text(fallback_msg, parse_mode="HTML")
+        return
+      
+    if len(plist) % 2 != 0:
+        imbalance_msg = (
+            "⚖️ <b>Imbalance Detected</b>\n\n"
+            "🚨 <b>Tactical Error:</b>\n"
+            "Player Numbers Are Not Equal! A Fair Game Requires \n"
+            "Balanced Teams For The Competition.\n\n"
+            "👉 <b>Action:</b> Add Or Remove 1 Player To Proceed.\n\n"
+            "📡 <i>System: Balance Protocol Failed.</i>"
+        )
+        await update.message.reply_text(imbalance_msg, parse_mode="HTML")
+        return
+      
+    random.shuffle(plist)
+    half = len(plist) // 2
+    game["teams"]["BJP"] = plist[:half]
+    game["teams"]["Congress"] = plist[half:]
+    game["spymasters"]["BJP"] = game["teams"]["BJP"][0]
+    game["spymasters"]["Congress"] = game["teams"]["Congress"][0]
+
+    game["board"] = generate_board()
+    game["turn"] = "BJP"
+    game["started"] = True
+
+    asyncio.create_task(run_timer(chat_id, context))
+    
+    msg_text = (
+        "🛡️ <b>Intelligence Briefing</b>\n\n"
+        "📡 <b>Scan Complete: Teams Assigned</b>\n\n"
+    )
+    
+    for team in ["BJP", "Congress"]:
+        team_players = ", ".join([f"<code>{uname(p)}</code>" for p in game["teams"][team]])
+        spymaster = uname(game["spymasters"][team])
+        icon = "🪷" if team == "BJP" else "🪬"
+        msg_text += (
+            f"{icon} <b>Team {team.upper()}</b>\n"
+            f"🕵️ <b>Spymaster:</b> <u>{spymaster}</u>\n"
+            f"👥 <b>Members:</b> {team_players}\n\n"
+        )
+
+    await context.bot.send_message(chat_id=chat_id, text=msg_text, parse_mode="HTML")
+    
+    await update.message.reply_text(
+        "🏆 <b>Teams Finalized</b>\n\n"
+        f"👤 <b>Game Creator:</b> {uname(user)}\n"
+        f"👉 <b>Next Step:</b> Use <code>/Ready</code> To Transmit \n"
+        f"The Secret Board To The Spymasters.\n\n"
+        f"📡 <i>System: Waiting For Spymaster Connection...</i>",
+        parse_mode="HTML"
+    )
+    
+    board_text = board_view(game["board"])
+    final_board_text = (
+        "🗺️ <b>The Active Game Board</b>\n\n"
+        f"{board_text}\n\n"
+        "🏁 <b>Current Turn:</b> <b>Team BJP 🪷</b>\n"
+        "📡 <i>Waiting For Spymaster's Clue Transmission...</i>"
+    )
+    
+    board_msg = await update.message.reply_text(final_board_text, parse_mode="HTML")
+    try:
+        await board_msg.pin(disable_notification=True)
+    except Exception:
+        pass
+
+async def shuffle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    Chat_Id = update.effective_chat.id
+    Game = games.get(Chat_Id)
+    User = update.effective_user
+    
+    if not Game or not Game["active"] or not Game.get("started"):
+        error_msg = (
+            "❌ <b>Error: Command Rejected</b>\n\n"
+            "🚨 <b>Game Not Found:</b>\n"
+            "No Active Operation Detected To Reshuffle.\n\n"
+            "📡 <i>System: Reshuffle Sequence Aborted.</i>"
+        )
+        await update.message.reply_text(error_msg, parse_mode="HTML")
+        return
+      
+    if User.id != Game["creator"]:
+        denied_msg = (
+            "❌ <b>Access Denied</b>\n\n"
+            "🚨 <b>Authorization Failed:</b>\n"
+            "Only The <b>Game Creator</b> Can Reshuffle The Teams!\n\n"
+            "⚡ <i>System: Security Override Rejected.</i>"
+        )
+        await update.message.reply_text(denied_msg, parse_mode="HTML")
+        return
+      
+    if Game.get("clue") is not None or any(V.get("revealed", False) for V in Game["board"].values()):
+        protocol_msg = (
+            "🚫 <b>Protocol Restricted</b>\n\n"
+            "🚨 <b>Tactical Lockdown:</b>\n"
+            "Clues Have Already Been Transmitted Or Targets Revealed.\n"
+            "Reshuffle Disabled To Prevent Intelligence Leaks!\n\n"
+            "📡 <i>System: Sequence Locked To Maintain Integrity.</i>"
+        )
+        await update.message.reply_text(protocol_msg, parse_mode="HTML")
+        return
+      
+    Game["ready_players"] = set() 
+    Game["turn"] = "BJP" 
+
+    Plist = list(Game["players"].values())
+    random.shuffle(Plist)
+    Half = len(Plist) // 2
+    Game["teams"]["BJP"] = Plist[:Half]
+    Game["teams"]["Congress"] = Plist[Half:]
+    
+    Game["spymasters"]["BJP"] = Game["teams"]["BJP"][0]
+    Game["spymasters"]["Congress"] = Game["teams"]["Congress"][0]
+
+    def cap_name(p):
+        Name = uname(p)
+        return " ".join([W.capitalize() for W in Name.split()])
+        
+    Msg_Text = (
+        "🔄 <b>Ranks Reshuffled</b>\n\n"
+        "📡 <b>New Team Assignments Detected:</b>\n\n"
+    )
+
+    for Team in ["BJP", "Congress"]:
+        Team_Players = ", ".join([f"<code>{cap_name(p)}</code>" for p in Game["teams"][Team]])
+        Spymaster = cap_name(Game["spymasters"][Team])
+        Icon = "🪷" if Team == "BJP" else "🪬"
+        Msg_Text += (
+            f"{Icon} <b>Team {Team.upper()}</b>\n"
+            f"🕵️ <b>Spymaster:</b> <u>{Spymaster}</u>\n"
+            f"👥 <b>Members:</b> {Team_Players}\n\n"
+        )
+
+    Msg_Text += (
+        "⚠️ <b>Notice:</b> Original Board Remains Active.\n"
+        "📡 <i>Spymasters, Use</i> <code>/Ready</code> <i>To Re-Acquire Intel.</i>"
+    )
+    
+    await update.message.reply_text(Msg_Text, parse_mode="HTML")
+    
+async def ready(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    game = games.get(chat_id)
+    
+    if not game or not game.get("active") or not game.get("started"):
+        no_mission_msg = (
+            "❌ <b>Error: Launch Failed</b>\n\n"
+            "🚨 <b>System Alert:</b>\n"
+            "No Active Mission Found Ready To Launch. \n"
+            "Initiate <code>/Startgame</code> First.\n\n"
+            "📡 <i>System: Satellite Link Offline.</i>"
+        )
+        await update.message.reply_text(no_mission_msg, parse_mode="HTML")
+        return
+      
+    if update.effective_user.id not in [game.get("creator"), game.get("starter_id")]:
+        access_denied_msg = (
+            "🚫 <b>Access Restricted</b>\n\n"
+            "🚨 <b>Denied:</b>\n"
+            "Only The <b>Game Creator</b> Can Authorize \n"
+            "The Transmission Of Secret Keys.\n\n"
+            "⚡ <i>Status: Authorization Failed.</i>"
+        )
+        await update.message.reply_text(access_denied_msg, parse_mode="HTML")
+        return
+      
+    current_board = game.get("board")
+    if not current_board:
+        map_error_msg = (
+            "🚨 <b>Critical System Error</b>\n\n"
+            "🚨 <b>Data Corruption:</b>\n"
+            "Game Map Not Found In The Mainframe! \n\n"
+            "👉 <b>Action:</b> Use <code>/Start</code> Again To Regenerate.\n"
+        )
+        await update.message.reply_text(map_error_msg, parse_mode="HTML")
+        return
+
+    processed_ids = set()
+    for team, spymaster in game["spymasters"].items():  
+        sid = spymaster.id if hasattr(spymaster, 'id') else spymaster
+        if sid < 0 or sid in processed_ids:
+            continue
+
+        try:
+          
+            secret_view = board_view(current_board, user_id=sid, game=game)
+            
+            secret_header = (
+                "🕵️‍♂️ <b>Secret Encrypted Key</b>\n\n"
+                f"🚩 <b>Team:</b> Team {team}\n\n"
+                f"{secret_view}\n\n"
+                "📡 <b>Intel:</b> Use <code>/Clue &lt;Word&gt; &lt;Number&gt;</code> \n"
+                "To Lead Your Team To Victory! ⚡"
+            )
+            
+            await context.bot.send_message(chat_id=sid, text=secret_header, parse_mode="HTML")
+            
+            rules_message = (
+                "🕵️ <b>Spymaster Protocol</b>\n\n"
+                "⚠️ <b>Strategic Clue Rules:</b>\n\n"
+                "1️⃣ <b>No Hindi:</b> Direct Hindi Words Are Strictly Forbidden. 🚫\n\n"
+                "2️⃣ <b>No Names:</b> Direct Words Or Names From Board Are Not Allowed. 👤\n\n"
+                "3️⃣ <b>No Code-Talk:</b> Abbreviations Like N-Word Or H-Word Are Prohibited. 📵\n\n"
+                "4️⃣ <b>No Hybrids:</b> Combining Words Like 'Vhome' (Villa+Home) Is Illegal. 🧪\n\n"
+                "5️⃣ <b>Single Word Only:</b> Clue Must Be Exactly <b>One</b> Word Only. ☝️\n\n"
+                "6️⃣ <b>No Reactions:</b> Do Not React To Any Messages With Emojis During The Game. 🤐\n\n"
+                "7️⃣ <b>Dictum:</b> Only Proper English Nouns, Verbs, Or Adjectives Are Allowed. 📖\n\n"
+                "⚖️ <b>Penalty System:</b>\n\n"
+                "🚩 <b>Quarantine Alert:</b> Violating Rules Will Trigger An <u>Immediate</u> Penalty.\n"
+                "⏳ Your Team Will <b>Skip 2 Turns</b> (Enemy Gets 4 Consecutive Moves). 💀\n\n"
+                "📡 <i>Transmit Your Clue Wisely, Agent. The Fate Of The Team Is In Your Hands.</i>"
+            )
+            await context.bot.send_message(chat_id=sid, text=rules_message, parse_mode="HTML")
+            processed_ids.add(sid)
+            
+        except Exception:
+            dm_warn_msg = (
+                "⚠️ <b>Uplink Failure</b>\n\n"
+                f"👤 <b>Agent:</b> <u>{uname(spymaster)}</u>\n"
+                "Communication Failed! You Must <b>Start</b> The Bot \n"
+                "In Private DM To Receive The Secret Board.\n"
+            )
+            await update.message.reply_text(dm_warn_msg, parse_mode="HTML")
+            
+    auth_msg = (
+        "🚀 <b>Mission Authorized</b>\n\n"
+        "📡 <b>Intel Dispatched:</b> Spymasters Have Received \n"
+        "The Secret Digital Keys In Their Private Channels.\n\n"
+        "🔥 <b>Game Status: Active</b>\n\n"
+        "The Board Is Live. The Satellite Link Is Stable. \n"
+        "<b>Team BJP 🪷</b>, The First Move Is Yours. Transmit \n"
+        "Your Coordinates And Let The Game Begin! 🎖️\n\n"
+        "⚠️ <i>Note: All Communications Are Now Monitored.</i>\n\n"
+        "🛠️ <b>Systems Architect:</b> @bhawanisinghshekhawatt"
+    )
+
+    await update.message.reply_text(text=auth_msg, parse_mode="HTML")
+
+async def check_word_validity(word):
+    url = f"https://api.dictionaryapi.dev/api/v2/entries/en/{word}"
+    try:
+        response = requests.get(url, timeout=5)
+        if response.status_code == 200:
+            return True
+        return False
+    except:
+        return True
+
+async def clue(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != "private":
+        dm_only_msg = (
+            "❌ <b>Secure Channel Required</b>\n\n"
+            "🚨 <b>Error:</b> Clues Must Be Transmitted Via <b>Private Dm</b> \n"
+            "To Prevent Intelligence Leaks To The Enemy!\n\n"
+            "📡 <i>System: Encryption Protocol Failed In Public.</i>"
+        )
+        await update.message.reply_text(dm_only_msg, parse_mode="HTML")
+        return
+
+    spymaster_games = [
+        (cid, g) for cid, g in games.items()
+        if update.effective_user.id in [sp.id if hasattr(sp, 'id') else sp for sp in g.get("spymasters", {}).values()] and g["active"]
+    ]
+
+    if not spymaster_games:
+        no_auth_msg = (
+            "❌ <b>Unauthorized Access</b>\n\n"
+            "🚨 <b>Denied:</b> You Are Not An Active Spymaster.\n"
+            "Only Designated Authorities Can Transmit Clues.\n\n"
+            "📡 <i>System: Biometric Signature Mismatch.</i>"
+        )
+        await update.message.reply_text(no_auth_msg, parse_mode="HTML")
+        return
+
+    chat_id, game = spymaster_games[0]
+    
+    bjp_spy_id = game["spymasters"]["BJP"].id if hasattr(game["spymasters"]["BJP"], 'id') else game["spymasters"]["BJP"]
+    team = "BJP" if bjp_spy_id == update.effective_user.id else "Congress"
+
+    if team.upper() == game.get("quarantine_team") and game.get("quarantine_turns", 0) > 0:
+        q_blocked_msg = (
+            "🚫 <b>Access Revoked</b>\n\n"
+            "🚨 <b>Denied:</b> Your Team Is Under <b>Quarantine</b>.\n"
+            f"⚖️ <b>Reason:</b> {game.get('quarantine_reason')}\n"
+            f"⏳ <b>Lockdown:</b> {game.get('quarantine_turns')} Turns Left.\n\n"
+            "📡 <i>System: All Outgoing Signals Jammed.</i>"
+        )
+        await update.message.reply_text(q_blocked_msg, parse_mode="HTML")
+        return
+
+    if game["turn"] != team:
+        turn_error_msg = (
+            "⏳ <b>Strategic Window Closed</b>\n\n"
+            f"🚨 <b>Wait:</b> It Is Not Your Turn Yet.\n"
+            f"Currently, Team <b>{game['turn']}</b> Is In Command.\n\n"
+            "📡 <i>System: Transmission Window Locked.</i>"
+        )
+        await update.message.reply_text(turn_error_msg, parse_mode="HTML")
+        return
+
+    try:
+        word = context.args[0]
+        num = int(context.args[1])
+        if num < 1 or num > 25: raise ValueError
+    except:
+        format_msg = (
+            "📝 <b>Transmission Format</b>\n\n"
+            "🚨 <b>Invalid Format:</b>\n"
+            "Use: <code>/Clue &lt;Word&gt; &lt;Number&gt;</code>\n"
+            "Example: <code>/Clue Sniper 2</code>\n\n"
+            "📡 <i>System: Data Packet Malformed.</i>"
+        )
+        await update.message.reply_text(format_msg, parse_mode="HTML")
+        return
+
+    if len(context.args) > 2:
+        single_word_msg = (
+            "🚫 <b>Security Alert</b>\n\n"
+            "🚨 <b>Denied:</b> Multi-Word Clues Are Prohibited!\n"
+            "Only A <b>Single Word</b> Clue Is Authorized.\n"
+        )
+        await update.message.reply_text(single_word_msg, parse_mode="HTML")
+        return
+
+    if not re.fullmatch(r'[A-Za-z]+', word):
+        alpha_error_msg = (
+            "❌ <b>Tactical Error</b>\n\n"
+            "🚨 <b>Invalid Characters:</b>\n"
+            "Clue Must Contain Only English Alphabets.\n"
+            "No Numbers, Symbols, Or Special Characters!\n"
+        )
+        await update.message.reply_text(alpha_error_msg, parse_mode="HTML")
+        return
+
+    if len(word) > 12:
+        len_error_msg = (
+            "🚫 <b>Length Violation</b>\n\n"
+            "🚨 <b>Denied:</b> Clue Word Is Too Long!\n"
+            "Maximum Authorized Length Is <b>12 Characters</b>.\n"
+            "📡 <i>System: Suspicious Data Pattern Detected.</i>"
+        )
+        await update.message.reply_text(len_error_msg, parse_mode="HTML")
+        return
+
+    try:
+        dict_url = f"https://api.dictionaryapi.dev/api/v2/entries/en/{word.lower()}"
+        response = requests.get(dict_url, timeout=5)
+        if response.status_code != 200:
+            dict_error_msg = (
+                "❌ <b>Invalid Dictionary</b>\n\n"
+                f"🚨 <b>Denied:</b> '<code>{word.upper()}</code>' Is Not A Valid Word!\n"
+                "Spelling Check Failed In The Global Database.\n"
+                "📡 <i>System: Linguistic Mismatch Detected.</i>"
+            )
+            await update.message.reply_text(dict_error_msg, parse_mode="HTML")
+            return
+    except:
+        pass
+
+    if word.lower() in HINDI_BLACKLIST:
+        hindi_error_msg = (
+            "🚫 <b>Intelligence Breach</b>\n\n"
+            "🚨 <b>Prohibited:</b> Hindi Keywords Or Direct \n"
+            "Vernacular Translations Are Strictly Banned!\n"
+        )
+        await update.message.reply_text(hindi_error_msg, parse_mode="HTML")
+        return
+
+    if game["clue"] is not None:
+        active_clue_msg = "⚠️ <b>Alert:</b> A Clue Is Already Active For This Turn!"
+        await update.message.reply_text(active_clue_msg, parse_mode="HTML")
+        return
+
+    game["clue"] = word
+    game["left"] = num 
+
+    clue_broadcast = (
+        "📡 <b>Incoming Intel Broadcast</b>\n\n"
+        "🚨 <b>High Command Strategic Briefing</b>\n\n"
+        f"👤 <b>Authority:</b> {uname(update.effective_user)} (<i>{team} Spymaster</i>)\n\n"
+        f"🗝️ <b>Encrypted Clue:</b> <code>{word.upper()}</code>\n"
+        f"🎯 <b>Strike Targets:</b> <code>{num}</code> Words\n\n"
+        f"🔥 <b>Mission Objective:</b>\n"
+        f"Team <b>{team.upper()}</b> Agents, Analyze The Battlefield Data \n"
+        "And Initiate Your Tactical Strikes Immediately.\n\n"
+        "⚠️ <i>Status: High-Risk Operation. Failure Is Not An Option.</i>\n\n"
+        "🛠️ <b>Systems Architect:</b> @bhawanisinghshekhawatt"
+    )
+
+    await context.bot.send_message(chat_id=chat_id, text=clue_broadcast, parse_mode="HTML")
+    
+    success_ack = (
+        "✅ <b>Uplink Successful</b>\n\n"
+        "📡 <b>Transmission Logged:</b>\n"
+        f"Clue <code>{word.upper()}</code> Dispatched To The Game Zone.\n"
+    )
+    await update.message.reply_text(success_ack, parse_mode="HTML")
+
+async def guess(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    game = games.get(chat_id)
+    if not game or not game["active"] or not game["started"]: 
+        return
+
+    user = update.effective_user
+    if user.id not in game["players"]: 
+        return
+
+    message_text = update.message.text if update.message and update.message.text else ""
+    is_command = message_text.startswith("/guess")
+    
+    if not is_command:
+        return
+
+    active_team = game["turn"]
+    q_team = game.get("quarantine_team")
+    
+    if q_team and active_team and q_team.upper() == active_team.upper():
+        await update.message.reply_text(
+            f"🚫 <b>Access Revoked:</b> Team <b>{active_team}</b> Is Currently Under Quarantine.",
+            parse_mode="HTML"
+        )
+        return
+    
+    spy_obj = game["spymasters"].get(active_team)
+    current_spymaster_id = spy_obj.id if hasattr(spy_obj, 'id') else spy_obj
+    
+    team_voters = [p.id if hasattr(p, 'id') else p for p in game["teams"][active_team] if (p.id if hasattr(p, 'id') else p) != current_spymaster_id]
+    all_team_ids = [p.id if hasattr(p, 'id') else p for p in game["teams"][active_team]]
+    
+    if user.id not in all_team_ids:
+        wrong_team_msg = (
+            "🛑 <b>Access Denied: Stand Down</b>\n\n"
+            f"🚨 <b>Error:</b> It Is Currently <b>Team {active_team}</b>'s Turn.\n"
+            "Unauthorized Tactical Interference Detected!\n\n"
+            "📡 <i>System: Wait For Your Team's Authorization.</i>"
+        )
+        await update.message.reply_text(wrong_team_msg, parse_mode="HTML")
+        return
+
+    if user.id == current_spymaster_id:
+        spy_deny_msg = (
+            "🚫 <b>Protocol Restriction</b>\n\n"
+            "🚨 <b>Restricted:</b> Spymasters Cannot Guess!\n"
+            "Only <b>Field Agents</b> Are Authorized To Transmit \n"
+            "Target Coordinates.\n\n"
+            "📡 <i>System: Intelligence Officer Blocked.</i>"
+        )
+        await update.message.reply_text(spy_deny_msg, parse_mode="HTML")
+        return
+
+    if not game["clue"]:
+        no_clue_msg = (
+            "⏳ <b>Hold Fire Agent!</b>\n\n"
+            "🚨 <b>Tactical Wait:</b>\n"
+            "No Active Clue Found. Wait For Your Spymaster \n"
+            "To Transmit The Intelligence 🗝️\n\n"
+            "📡 <i>System: Target Acquisition Offline.</i>"
+        )
+        await update.message.reply_text(no_clue_msg, parse_mode="HTML")
+        return
+
+    if context.args:
+        word = context.args[0].upper()
+    else:
+        usage_msg = (
+            "⚠️ <b>Invalid Command Format</b>\n\n"
+            "🚨 <b>Usage:</b> <code>/Guess &lt;Word&gt;</code>\n"
+            "Example: <code>/Guess Apple</code>\n\n"
+            "📡 <i>System: Coordinates Missing.</i>"
+        )
+        await update.message.reply_text(usage_msg, parse_mode="HTML")
+        return
+
+    board = game["board"]
+    if word not in board or board[word]["revealed"]: 
+        return
+
+    if len(team_voters) > 1:
+        if game.get("pending_vote"):
+            pending_vote_msg = (
+                "⚠️ <b>Vote In Progress</b>\n\n"
+                "🚨 <b>Strike Delayed:</b>\n"
+                "A Tactical Vote Is Already Active. Finish \n"
+                "The Current Authorization First.\n"
+            )
+            await update.message.reply_text(pending_vote_msg, parse_mode="HTML")
+            return
+
+        needed = (len(team_voters) // 2) + 1
+        game["pending_vote"] = {
+            "word": word,
+            "yes_votes": [user.id],
+            "no_votes": [],
+            "needed": needed,
+            "user": user,
+            "voters": team_voters 
+        }
+
+        keyboard = [[
+            InlineKeyboardButton(f"✅ Yes (1/{needed})", callback_data="v_yes"),
+            InlineKeyboardButton("❌ No (0)", callback_data="v_no")
+        ]]
+        
+        vote_msg = (
+            "🗳️ <b>Authorization Required</b>\n\n"
+            "📡 <b>Incoming Strike Request:</b>\n\n"
+            f"👤 <b>Agent:</b> {uname(user)}\n"
+            f"🔡 <b>Target Word:</b> <code>{word.upper()}</code>\n\n"
+            "🧩 <b>Protocol:</b> Team Members, Your Confirmation \n"
+            f"Is Mandatory. We Need <b>{needed}</b> More Votes To \n"
+            "Finalize This Strike.\n\n"
+            "⚠️ <i>Status: Awaiting Tactical Consensus...</i>"
+        )
+
+        sent_msg = await update.message.reply_text(
+            text=vote_msg,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="HTML"
+        )
+        game["last_vote_message_id"] = sent_msg.message_id
+        return
+
+    await execute_guess_logic(update, context, game, word, user)
+
+async def execute_guess_logic(update, context, game, word, user):
+    if update.callback_query:
+        chat_id = update.callback_query.message.chat_id
+    else:
+        chat_id = update.effective_chat.id
+        
+    board = game["board"]
+    active_team = game["turn"]
+    
+    board[word]["revealed"] = True
+    role = board[word].get("team", board[word].get("role", "Neutral")) 
+    game["left"] -= 1
+
+    if "stats" not in game:
+        game["stats"] = {}
+    
+    u_id = user.id
+    if u_id not in game["stats"]:
+        game["stats"][u_id] = {"correct": 0, "wrong": 0, "assassin": 0, "name": uname(user)}
+
+    if role == active_team:
+        game["stats"][u_id]["correct"] += 1
+    elif role == "Assassin":
+        game["stats"][u_id]["assassin"] += 1
+    else:
+        game["stats"][u_id]["wrong"] += 1
+    
+    emoji_map = {"BJP": "🪷", "Congress": "🪬", "Neutral": "🍁", "Assassin": "🏴‍☠️"}
+    
+    result_msg = (
+        "🔍 <b>Word Analysis Results</b>\n\n"
+        "📡 <b>Data Decrypted:</b>\n\n"
+        f"👤 <b>Agent:</b> {uname(user)}\n"
+        f"🔡 <b>Word Identified:</b> <code>{word.title()}</code>\n"
+        f"🏷️ <b>Identity:</b> {emoji_map.get(role, '❓')} <b>{role.upper()}</b>\n\n"
+        "🛰️ <i>Status: Game Board Updated...</i>"
+    )
+
+    def switch(t): return "Congress" if t == "BJP" else "BJP"
+
+    if role == "Assassin":
+        reset_all_votes(game)
+
+        if "last_vote_message_id" in game:
+            try:
+                reset_text = "🗳️ <b>Voting Reset:</b> No Active Votes For This Turn."
+                await context.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=game["last_vote_message_id"],
+                    text=reset_text,
+                    parse_mode="HTML"
+                )
+            except Exception as e:
+                print(f"Vote Reset Message Error: {e}")
+            
+        if game.get("shield_active"):
+            game["shield_active"] = False
+            game["left"] = 0
+            next_t = switch(active_team)
+            game["turn"], game["clue"] = next_t, None
+            await context.bot.send_message(chat_id, "🛡️ <b>Body Armor Saved The Squad!</b>\nShield Absorbed The Blast. Turn Switched.", parse_mode="HTML")
+            return
+
+        game["active"] = False
+        winner = switch(active_team)
+
+        for p in game["teams"][winner]:
+            uid = p.id if hasattr(p, 'id') else p
+            collection.update_one({"_id": uid}, {"$inc": {"wins": 1}}, upsert=True)
+        
+        assassin_msg = (
+            "💀 <b>Critical Mission Failure</b>\n\n"
+            "🏴‍☠️ <b>Terminal Error: Assassin Activated!</b>\n\n"
+            f"The Word <code>{word.upper()}</code> Was The Lethal Assassin.\n"
+            "By Revealing It, Your Team Has Lost The Game \n"
+            "Immediately. The Enemy Has Taken Control.\n\n"
+            "🚨 <b>System Override In Progress:</b>\n\n"
+            "⚠️ <i>Location: Exposed</i>\n"
+            "⚠️ <i>Field Agents: Captured</i>\n"
+            "⚠️ <i>Safehouse: Compromised</i>\n\n"
+            f"🏆 <b>Victory By Default: Team {winner.upper()}</b>\n\n"
+            "📡 <b>Event Logs:</b>\n\n"
+            f"• <b>Triggered By:</b> {uname(user)}\n"
+            f"• <b>Lethal Sector:</b> {word.upper()}\n"
+            "• <b>Outcome:</b> Total Team Neutralization\n\n"
+            "📢 <b>Final Broadcast:</b>\n"
+            "<i>'One Wrong Move, And You Become A Ghost In \n"
+            "The Machine. Goodbye, Agents.'</i>\n\n"
+            "🎮 <i>Game Over. The Assassin Always Wins.</i>"
+        )
+        
+        await context.bot.send_message(chat_id, assassin_msg, parse_mode="HTML")
+        try: await send_winner_image(context, chat_id, winner)
+        except: pass
+        
+        report_msg = await get_end_game_report(game)
+        await context.bot.send_message(chat_id=chat_id, text=report_msg, parse_mode="HTML")
+        return
+
+    remaining_bjp = sum(1 for v in board.values() if v.get("team", v.get("role")) == "BJP" and not v["revealed"])
+    remaining_con = sum(1 for v in board.values() if v.get("team", v.get("role")) == "Congress" and not v["revealed"])
+
+    if remaining_bjp == 0 or remaining_con == 0:
+        reset_all_votes(game)
+
+        if "last_vote_message_id" in game:
+            try:
+                reset_text = "🗳️ <b>Voting Reset:</b> No Active Votes For This Turn."
+                await context.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=game["last_vote_message_id"],
+                    text=reset_text,
+                    parse_mode="HTML"
+                )
+            except Exception as e:
+                print(f"Vote Reset Message Error: {e}")
+            
+        winning_team = "BJP" if remaining_bjp == 0 else "Congress"
+        game["active"] = False
+        
+        for p in game["teams"][winning_team]:
+            uid = p.id if hasattr(p, 'id') else p
+            reward = 500
+            current_data = collection.find_one({"_id": uid})
+            old_balance = int(current_data.get("coins", 0)) if current_data else 0
+            new_balance = old_balance + reward
+            
+            collection.update_one(
+                {"_id": uid}, 
+                {
+                    "$set": {"coins": new_balance, "name": uname(p)},
+                    "$inc": {"wins": 1}
+                }, 
+                upsert=True
+            )
+
+            if old_balance < 0:
+                debt_msg = (
+                    "💳 <b>Debt Recovery Notice</b>\n\n"
+                    f"👤 <b>Agent:</b> {uname(p)}\n"
+                    f"💰 <b>Earned:</b> 🪙 <code>{reward}</code>\n"
+                    f"📉 <b>Previous Loan:</b> <code>{old_balance}</code>\n"
+                    f"💳 <b>Current Status:</b> <code>{new_balance}</code>\n"
+                )
+                await context.bot.send_message(chat_id=chat_id, text=debt_msg, parse_mode="HTML")
+        
+        final_msg = (
+            "🏁 <b>Mission Accomplished</b>\n\n"
+            "🏆 <b>The Winners Have Been Decided!</b>\n\n"
+            f"Team <b>{winning_team.upper()}</b> Has Seized Total Control Of \n"
+            "The Intelligence Grid. The Opposition \n"
+            "Has Been Completely Dismantled!\n\n"
+            "📜 <b>Victory Archives:</b>\n\n"
+            "🎖️ <b>Status:</b> Absolute Dominance\n"
+            f"👤 <b>Final Strike By:</b> {uname(user)}\n"
+            "💰 <b>Bounty:</b> 🪙 <code>500</code> Coins Transferred\n\n"
+            "📢 <b>Supreme Leader's Declaration:</b>\n"
+            "<i>'Today, Every Word Was A Map To \n"
+            "Destiny. Success Is The Only Option.'</i>\n\n"
+            "👑 <b>Long Live The Winners!</b>\n"
+            "🛰️ <b>The Code Is Broken.</b>\n\n"
+            "🎮 <i>Thank You For Playing Codenames.</i>"
+        )
+        
+        await context.bot.send_message(chat_id, final_msg, parse_mode="HTML")
+        try: await send_winner_image(context, chat_id, winning_team)
+        except: pass
+        
+        report_msg = await get_end_game_report(game)
+        await context.bot.send_message(chat_id=chat_id, text=report_msg, parse_mode="HTML")
+        return
+
+    status_msg = ""
+    if role != active_team or game["left"] <= 0:
+        reset_all_votes(game)
+        if "last_vote_message_id" in game:
+            try:
+                reset_text = "🗳️ <b>Voting Reset:</b> No Active Votes For This Turn."
+                await context.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=game["last_vote_message_id"],
+                    text=reset_text,
+                    parse_mode="HTML"
+                )
+            except Exception as e:
+                print(f"Vote Reset Message Error: {e}")
+            
+        next_t = switch(active_team)
+        q_team = game.get("quarantine_team")
+        q_turns = game.get("quarantine_turns", 0)
+
+        if q_team and next_t and next_t.upper() == q_team.upper() and q_turns > 0:
+            game["quarantine_turns"] -= 1
+            game["turn"] = active_team
+            game["clue"] = None
+            status_msg = f"\n\n🚫 <b>Quarantine Alert:</b> Team <b>{next_t.upper()}</b> Skipped. Turns Left: {game['quarantine_turns']}"
+            if game["quarantine_turns"] <= 0:
+                game["quarantine_team"] = None
+        else:
+            game["turn"] = next_t
+            game["clue"] = None
+            status_msg = f"\n\n🔄 <b>Turn Switched:</b> Team <b>{next_t.upper()}</b> In Command."
+    else:
+        reset_all_votes(game)
+        if "last_vote_message_id" in game:
+            try:
+                reset_text = "🗳️ <b>Voting Reset:</b> No Active Votes For This Turn."
+                await context.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=game["last_vote_message_id"],
+                    text=reset_text,
+                    parse_mode="HTML"
+                )
+            except Exception as e:
+                print(f"Vote Reset Message Error: {e}")
+            
+        status_msg = f"\n\n✅ <b>Strike Secured:</b> <b>{game['left']}</b> Moves Left."
+
+    await context.bot.send_message(chat_id, f"{result_msg}{status_msg}", parse_mode="HTML")
+    
+    board_text = (
+        "🗺️ <b>Active Game Map</b>\n\n"
+        f"{board_view(board)}"
+    )
+    
+    new_board_msg = await context.bot.send_message(chat_id, board_text, parse_mode="HTML")
+    try:
+        await context.bot.unpin_all_chat_messages(chat_id=chat_id)
+        await new_board_msg.pin(disable_notification=True)
+    except Exception as e:
+        print(f"Pin Error: {e}")
+
+async def handle_vote(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = query.from_user.id
+    chat_id = query.message.chat_id
+    game = games.get(chat_id)
+
+    if not game or not game.get("pending_vote"): 
+        return
+
+    vote_data = game["pending_vote"]
+    current_team = game.get("turn")
+    
+    spy_obj = game["spymasters"].get(current_team)
+    current_spymaster_id = spy_obj.id if hasattr(spy_obj, 'id') else spy_obj
+
+    if user_id == current_spymaster_id:
+        await query.answer("🛑 Access Denied: Spymasters Are Observers, Not Voters!", show_alert=True)
+        return
+
+    team_voters = vote_data.get("voters", [])
+    if user_id not in team_voters:
+        await query.answer("🛑 Unauthorized: Only Active Field Agents Can Authorize Strikes!", show_alert=True)
+        return
+
+    if query.data == "v_yes":
+        if user_id not in vote_data["yes_votes"]:
+            vote_data["yes_votes"].append(user_id)
+            if user_id in vote_data["no_votes"]: 
+                vote_data["no_votes"].remove(user_id)
+    elif query.data == "v_no":
+        if user_id not in vote_data["no_votes"]:
+            vote_data["no_votes"].append(user_id)
+            if user_id in vote_data["yes_votes"]: 
+                vote_data["yes_votes"].remove(user_id)
+
+    if len(vote_data["yes_votes"]) >= vote_data["needed"]:
+        word, user = vote_data["word"], vote_data["user"]
+        game["pending_vote"] = None
+        try: 
+            await query.message.delete()
+        except: 
+            pass
+        await execute_guess_logic(update, context, game, word, user)
+
+    elif len(vote_data["no_votes"]) >= vote_data["needed"]:
+        game["pending_vote"] = None
+        
+        fail_msg = (
+            "❌ <b>Vote Rejected: Abort Mission</b>\n\n"
+            "🚨 <b>Consensus Failed:</b>\n"
+            f"The Team Has Rejected The Guess For: <code>{vote_data['word'].upper()}</code>\n\n"
+            "📡 <i>System: Strike Authorization Cancelled By Squad.</i>"
+        )
+        await query.message.edit_text(fail_msg, parse_mode="HTML")
+
+    else:
+        keyboard = [[
+            InlineKeyboardButton(f"✅ Yes ({len(vote_data['yes_votes'])}/{vote_data['needed']})", callback_data="v_yes"),
+            InlineKeyboardButton(f"❌ No ({len(vote_data['no_votes'])})", callback_data="v_no")
+        ]]
+        try: 
+            await query.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(keyboard))
+        except: 
+            pass
+        await query.answer("Vote Logged.")
+
+async def get_end_game_report(game):
+    if "stats" not in game or not game["stats"]:
+        return "📡 <i>System: No Tactical Data Recorded For This Mission.</i>"
+    
+    stats = game["stats"]
+    
+    report = (
+        "◈ <b>Mission Debriefing</b> ◈\n\n"
+        "📡 <b>Field Agent Statistics:</b>\n\n"
+    )
+
+    mvp_id = max(stats, key=lambda x: stats[x]['correct'], default=None)
+    lvp_id = max(
+        stats, 
+        key=lambda x: (stats[x]['wrong'], -stats[x]['correct']) if stats[x]['wrong'] > 0 else (-1, -1), 
+        default=None
+    )
+
+    if lvp_id == mvp_id and len(stats) > 1:
+        others = [uid for uid in stats if uid != mvp_id and stats[uid]['wrong'] > 0]
+        if others:
+            lvp_id = max(others, key=lambda x: (stats[x]['wrong'], -stats[x]['correct']))
+
+    for uid, data in stats.items():
+        safe_name = data['name'].replace("<", "&lt;").replace(">", "&gt;")
+        
+        report += f"▸ <b>{safe_name}</b>\n"
+        report += (
+            f"  ⚡ Strikes: <code>{data['correct']}</code>\n"
+            f"  ⚠️ Errors: <code>{data['wrong']}</code>\n"
+            f"  💀 Lethal: <code>{data['assassin']}</code>\n\n"
+        )
+    
+    report += "<b>Performance Highlights:</b>\n\n"
+    
+    if mvp_id and stats[mvp_id]['correct'] > 0:
+        report += f"🥇 <b>Elite Striker:</b> {stats[mvp_id]['name']}\n"
+    
+    if lvp_id and stats[lvp_id]['wrong'] > 0:
+        report += f"🚩 <b>Under Investigation:</b> {stats[lvp_id]['name']}\n\n"
+    
+    report += "📡 <i>Status: Tactical Intel Archived.</i>"
+    
+    return report
+
+async def endturn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    Chat_Id = update.effective_chat.id
+    Game = games.get(Chat_Id)
+    if not Game or not Game.get("active"): 
+        return
+    
+    Uid = update.effective_user.id
+    Active_Team = Game["turn"]
+    
+    Is_Member = False
+    for P in Game["teams"][Active_Team]:
+        Pid = P.id if hasattr(P, 'id') else P
+        if Pid == Uid:
+            Is_Member = True
+            break
+            
+    if not Is_Member:
+        access_denied_msg = (
+            "❌ <b>Access Denied</b>\n\n"
+            f"🚨 <b>Unauthorized:</b> Only Active <b>{Active_Team}</b> \n"
+            "Team Members Can Authorize A Turn Conclusion.\n\n"
+            "📡 <i>System: Command Source Rejected.</i>"
+        )
+        await update.message.reply_text(access_denied_msg, parse_mode="HTML")
+        return
+
+    Spy_Obj = Game["spymasters"].get(Active_Team)
+    Spy_Id = Spy_Obj.id if hasattr(Spy_Obj, 'id') else Spy_Obj
+
+    if Uid == Spy_Id:
+        spy_err_msg = (
+            "🚫 <b>Operations Error</b>\n\n"
+            "🚨 <b>Restricted:</b> Spymasters Are Not Authorized \n"
+            "To Conclude The Turn Directly. Field Agents Must \n"
+            "Confirm The Decision.\n\n"
+            "📡 <i>System: Protocol Violation.</i>"
+        )
+        await update.message.reply_text(spy_err_msg, parse_mode="HTML")
+        return
+    
+    Team_Voters = []
+    for P in Game["teams"][Active_Team]:
+        Pid = P.id if hasattr(P, 'id') else P
+        if Pid != Spy_Id:
+            Team_Voters.append(Pid)
+    
+    Total_Needed = len(Team_Voters)
+    
+    if Total_Needed <= 1:
+        await execute_endturn_logic(update, context, Game)
+        return
+
+    if Game.get("pending_end_vote"):
+        vote_active_msg = (
+            "⚠️ <b>Vote In Progress</b>\n\n"
+            "🚨 <b>Alert:</b> A Turn Conclusion Vote Is Already \n"
+            "Active. Coordinate With Your Squad.\n"
+        )
+        await update.message.reply_text(vote_active_msg, parse_mode="HTML")
+        return
+
+    Game["pending_end_vote"] = {
+        "votes": [Uid],
+        "needed": Total_Needed,
+        "voters": Team_Voters
+    }
+
+    Keyboard = [[
+        InlineKeyboardButton(f"✅ End Turn (1/{Total_Needed})", callback_data="e_yes"),
+        InlineKeyboardButton("❌ Cancel", callback_data="e_no")
+    ]]
+    
+    conclusion_msg = (
+        "🔄 <b>Handover Protocol</b>\n\n"
+        "📡 <b>Strategic Withdrawal Initiated</b>\n\n"
+        f"🚩 <b>Active Team:</b> {Active_Team.upper()}\n"
+        f"📊 <b>Votes Required:</b> <b>{Total_Needed}</b> Agents\n\n"
+        "🧩 <b>Instructions:</b>\n"
+        "All Field Agents Must Confirm To End Current \n"
+        "Operations And Hand Over The Game Board.\n\n"
+        "⚠️ <i>Status: Awaiting Unit Consensus...</i>"
+    )
+
+    await update.message.reply_text(
+        text=conclusion_msg,
+        reply_markup=InlineKeyboardMarkup(Keyboard),
+        parse_mode="HTML"
+    )
+
+async def handle_endturn_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    Query = update.callback_query
+    User_Id = Query.from_user.id
+    Chat_Id = Query.message.chat_id
+    Game = games.get(Chat_Id)
+
+    if not Game or "pending_end_vote" not in Game:
+        await Query.answer("❌ Error: No Active Turn Vote Found!", show_alert=True)
+        return
+
+    Vote_Data = Game["pending_end_vote"]
+    
+    if User_Id not in Vote_Data["voters"]:
+        await Query.answer("🛑 Unauthorized: Only Field Agents Of The Active Team Can Vote!", show_alert=True)
+        return
+
+    if Query.data == "e_yes":
+        if User_Id not in Vote_Data["votes"]:
+            Vote_Data["votes"].append(User_Id)
+            await Query.answer("✅ Vote Recorded!")
+        else:
+            await Query.answer("⚠️ You Have Already Authorized This Handover!", show_alert=True)
+            return
+            
+    elif Query.data == "e_no":
+        Game.pop("pending_end_vote", None)
+        cancel_msg = (
+            "❌ <b>Handover Cancelled</b>\n\n"
+            "🚨 <b>Strategic Alert:</b>\n"
+            "The Turn Conclusion Has Been Aborted. \n"
+            "The Mission Continues For The Current Team!\n\n"
+            "📡 <i>System: Resuming Current Tactical Operations.</i>"
+        )
+        await Query.message.edit_text(cancel_msg, parse_mode="HTML")
+        return
+
+    Current_Count = len(Vote_Data["votes"])
+    Needed = Vote_Data["needed"]
+
+    if Current_Count >= Needed:
+        Game.pop("pending_end_vote", None)
+        try:
+            await Query.message.delete()
+        except Exception:
+            pass
+        await execute_endturn_logic(update, context, Game)
+    else:
+        Keyboard = [[
+            InlineKeyboardButton(f"✅ End Turn ({Current_Count}/{Needed})", callback_data="e_yes"),
+            InlineKeyboardButton("❌ Cancel", callback_data="e_no")
+        ]]
+        try:
+            await Query.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(Keyboard))
+        except Exception:
+            pass
+
+async def execute_endturn_logic(update, context, game):
+    Chat_Id = update.effective_chat.id if hasattr(update, 'effective_chat') else update.callback_query.message.chat_id
+    Active_Team = game["turn"]
+    
+    Next_Team = "Congress" if Active_Team == "BJP" else "BJP"
+    game["turn"] = Next_Team
+    game["clue"] = None
+    game["left"] = 0
+    
+    reset_all_votes(game)
+
+    if "last_vote_message_id" in game:
+        try:
+            reset_text = "🗳️ <b>Voting Reset:</b> No Active Votes For This Turn."
+            await context.bot.edit_message_text(
+                chat_id=Chat_Id,
+                message_id=game["last_vote_message_id"],
+                text=reset_text,
+                parse_mode="HTML"
+            )
+        except Exception as e:
+            print(f"Vote Reset Message Error: {e}")
+            
+    Msg = (
+        "🔄 <b>Control Transfer</b>\n\n"
+        "📡 <b>Turn Conclusion Completed</b>\n\n"
+        "The Game Board Has Been Handed Over To:\n"
+        f"🚩 <b>Team {Next_Team.upper()}</b>\n\n"
+        "⚡ <b>Status:</b> Awaiting New Intelligence...\n"
+        "🛰️ <i>System: Scanning For Next Spymaster Signal.</i>"
+    )
+
+    await context.bot.send_message(
+        chat_id=Chat_Id,
+        text=Msg,
+        parse_mode="HTML"
+    )
+
+async def turn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    Chat_Id = update.effective_chat.id
+    Game = games.get(Chat_Id)
+    
+    if not Game or not Game.get("active"):
+        return
+
+    Active_Team = Game['turn']
+    Team_Emoji = "🪷" if Active_Team == "BJP" else "🪬"
+    team_name = str(Active_Team).upper() if Active_Team else "UNKNOWN"
+    
+    Turn_Msg = (
+        "🎯 <b>Current Turn Briefing</b>\n\n"
+        "📡 <b>Signal Intercepted: Data Analysis...</b>\n\n"
+        f"📍 <b>Active Control:</b> {Team_Emoji} <b>{team_name}</b>\n"
+        "⚡ <b>Status:</b> Waiting For Commands\n\n"
+        f"Field Agents Of <b>Team {team_name}</b>, The Mission \n"
+        "Is In Your Hands. Analyze The Grid, Synchronize \n"
+        "Your Targets, And Execute. ⏳\n\n"
+        "⚠️ <i>Objective: Tactical Guess Required.</i>"
+    )
+
+    await update.message.reply_text(
+        text=Turn_Msg,
+        parse_mode="HTML"
+    )
+
+async def guide(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    Guide_Text = (
+        "📖 <b>Mission Handbook: Rules</b>\n\n"
+        "🛡️ <b>Basic Protocol:</b>\n\n"
+        "• 🚩 <b>Teams:</b> Game Mein 2 Teams Hoti Hain — <b>Bjp</b> Vs <b>Congress</b>.\n\n"
+        "• 📝 <b>Joining:</b> Lobby Banne Par <code>/Join</code> Se Mission Mein Enter Karein.\n\n"
+        "• 🕵️ <b>Spymasters:</b> Dono Team Mein 1-1 Spymaster Aur Baaki Field Agents Hote Hain.\n\n"
+        "• 📜 <b>Game Board:</b> Board Par 25 Words Hote Hain. Inki Asli Identity Sirf Spymasters Ko Pata Hoti Hai.\n\n"
+        "• 📊 <b>Intel Distribution:</b>\n"
+        "  - 🪷 <b>Bjp:</b> 8 Words\n"
+        "  - 🪬 <b>Congress:</b> 8 Words\n"
+        "  - 🍁 <b>Neutral:</b> 8 Words (Innocent)\n"
+        "  - 🏴‍☠️ <b>Assassin:</b> 1 Word (Death Trap)\n\n"
+        "• 🎯 <b>Mission Goal:</b> Jo Team Apne 8 Words Sabse Pehle Dhoond Legi, Wo Jeet Jayegi.\n\n"
+        "• 🗝️ <b>Clues:</b> Spymaster Ek Secret 'Clue' Aur 'Number' Dega, Jise Decode Karke Agents Ko Guess Karna Hoga.\n\n"
+        "• ⚠️ <b>Operational Risks:</b>\n"
+        "  - Dushman Ka Word Guess Kiya Toh Unhe Point Milega.\n"
+        "  - Neutral Word Par Turn Khatam Ho Jayegi.\n"
+        "  - <b>Assassin (🏴‍☠️)</b> Ko Touch Kiya Toh Team <u>Instant Lose</u> Ho Jayegi.\n\n"
+        "• ◽ <b>Guess Command:</b> <code>/Guess &lt;Word&gt;</code>\n\n"
+        "🫡 <b>Good Luck Agents. Stay Sharp.</b>\n"
+        "🛠️ <b>Systems Architect:</b> @jeffreygoonstein"
+    )
+
+    await update.message.reply_text(
+        text=Guide_Text,
+        parse_mode="HTML"
+    )
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    Chat_Id = update.effective_chat.id
+    Game = games.get(Chat_Id)
+    
+    if not Game or not Game.get("active"):
+        return
+
+    if update.effective_user.id != Game["creator"]:
+        denied_msg = (
+            "❌ <b>Access Denied</b>\n\n"
+            "🚨 <b>Error:</b> Only The <b>Game Creator</b> Who \n"
+            "Initiated The Mission Can Call A Ceasefire!\n\n"
+            "📡 <i>System: Security Override Failed.</i>"
+        )
+        await update.message.reply_text(denied_msg, parse_mode="HTML")
+        return
+        
+    Game["active"] = False
+    
+    Abort_Msg = (
+        "🛑 <b>Mission Terminated</b>\n\n"
+        "🚨 <b>System Breach: Ceasefire Order</b>\n\n"
+        "The Game Creator Has Issued A <b>Level-5 Emergency Order</b>. \n"
+        "All Active Tactical Operations Have Been Terminated.\n\n"
+        f"👤 <b>Authority:</b> {update.effective_user.first_name}\n"
+        "📡 <b>Status:</b> Operation Cancelled\n"
+        "💔 <b>Outcome:</b> Mission Aborted\n\n"
+        "The Battlefield Is Now Cold. Stand Down, Agents. 🎖️\n\n"
+        "🛰️ <i>System: Intel Logs Cleared.</i>"
+    )
+
+    await update.message.reply_text(
+        text=Abort_Msg,
+        parse_mode="HTML"
+    )
+
+async def changespy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    game = games.get(chat_id)
+    if not game or not game["active"]: return
+
+    if update.effective_user.id != game["creator"]:
+        await update.message.reply_text("❌ <b>Rejected: Only The Game Creator Can Reassign Command!</b> 👑", parse_mode="HTML")
+        return
+
+    if game["clue"] is not None or any(v["revealed"] for v in game["board"].values()):
+        await update.message.reply_text("🚫 <b>Too Late:</b> Strategic Clues Are Already Live. Spy Change Is Forbidden! 🗝️", parse_mode="HTML")
+        return
+
+    try:
+        team_input = "BJP" if context.args[0].upper() == "BJP" else "Congress"
+        target_input = context.args[1]
+    except:
+        usage_msg = (
+            "📝 <b>System Usage Protocol</b>\n\n"
+            "👉 <b>Command:</b> <code>/Changespy &lt;Team&gt; &lt;User_Id/Username&gt;</code>\n"
+            "💡 <b>Example:</b> <code>/Changespy Bjp @Jeffreygoonstein</code>"
+        )
+        await update.message.reply_text(usage_msg, parse_mode="HTML")
+        return
+
+    target_user = None
+    for p in game["players"].values():
+        if str(p.id) == target_input or uname(p) == target_input:
+            target_user = p
+            break
+
+    if not target_user:
+        await update.message.reply_text(f"❌ <b>Error:</b> Player <code>{target_input}</code> Not Found In Lobby!", parse_mode="HTML")
+        return
+
+    if target_user.id not in [p.id for p in game["teams"][team_input]]:
+        await update.message.reply_text(f"❌ <b>Dispute:</b> That Player Is Not In <b>Team {team_input}</b>! 🚩", parse_mode="HTML")
+        return
+
+    game["spymasters"][team_input] = target_user
+    
+    success_msg = (
+        "🕵️‍♂️ <b>New Command Assigned</b>\n\n"
+        "📡 <b>Intel Update:</b> Intelligence Leadership For \n"
+        f"<b>Team {team_input}</b> Has Been Transferred.\n\n"
+        f"👤 <b>New Spymaster:</b> <u>{uname(target_user)}</u> ⚡\n\n"
+        "⚠️ <b>Protocol:</b> New Spymaster Must Use <code>/Ready</code> \n"
+        "To Re-Establish The Encrypted Satellite Link."
+    )
+    await update.message.reply_text(success_msg, parse_mode="HTML")
+
+async def changeteam(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    game = games.get(chat_id)
+    if not game or not game["active"]: return
+    
+    if game["clue"] is not None:
+        await update.message.reply_text("🚫 <b>Too Late:</b> The Game Has Begun. Team Changes Are No Longer Allowed! 🚩", parse_mode="HTML")
+        return
+
+    user = update.effective_user
+    if user.id not in game["players"]:
+        await update.message.reply_text("❌ <b>Error:</b> You Must Join The Game First With <code>/Join</code>!", parse_mode="HTML")
+        return
+
+    current_team = "BJP" if any((p.id if hasattr(p, 'id') else p) == user.id for p in game["teams"]["BJP"]) else "Congress"
+    new_team = "Congress" if current_team == "BJP" else "BJP"
+
+    game["teams"][current_team] = [p for p in game["teams"][current_team] if (p.id if hasattr(p, 'id') else p) != user.id]
+    game["teams"][new_team].append(user)
+    
+    if game["spymasters"].get(current_team) and (game["spymasters"][current_team].id if hasattr(game["spymasters"][current_team], 'id') else game["spymasters"][current_team]) == user.id:
+        if game["teams"][current_team]:
+            game["spymasters"][current_team] = game["teams"][current_team][0]
+        else:
+            del game["spymasters"][current_team]
+
+    # Fix: Added 'f' before the string to render uname(user)
+    switch_msg = (
+        "🔄 <b>Team Switch Detected</b>\n\n"
+        f"🚨 <b>Agent Update:</b> Agent <u>{uname(user)}</u> Has \n"
+        f"Left <b>Team {current_team}</b>.\n\n"
+        f"🚩 <b>New Alliance:</b> Switched To <b>Team {new_team}</b>\n\n"
+        "📡 <i>Status: Bio-Signature Successfully Re-Registered.</i>"
+    )
+    await update.message.reply_text(switch_msg, parse_mode="HTML")
+
+async def ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        usage_msg = (
+            "⚠️ <b>Missing Parameters</b>\n\n"
+            "🚨 <b>Error:</b> Target Word Is Required.\n"
+            "Use: <code>/Ask &lt;Word&gt;</code>\n"
+            "Example: <code>/Ask Sniper</code>\n"
+        )
+        await update.message.reply_text(usage_msg, parse_mode="HTML")
+        return
+    
+    word_query = context.args[0].lower()
+    
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+
+    url = f"https://api.dictionaryapi.dev/api/v2/entries/en/{word_query}"
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(url)
+            
+            if resp.status_code == 404:
+                not_found_msg = (
+                    "❌ <b>Intel Not Found</b>\n\n"
+                    f"🚨 <b>Data Void:</b> Word <code>{word_query.upper()}</code> Not Found.\n"
+                    "It Might Be A Slang Or Classified Code-Word.\n"
+                )
+                await update.message.reply_text(not_found_msg, parse_mode="HTML")
+                return
+            
+            if resp.status_code != 200:
+                offline_msg = (
+                    "⚠️ <b>Database Offline</b>\n\n"
+                    "🚨 <b>Connection Lost:</b> Intelligence Database \n"
+                    "Is Currently Unreachable. Try Again Later.\n"
+                )
+                await update.message.reply_text(offline_msg, parse_mode="HTML")
+                return
+
+            data = resp.json()
+            entry = data[0]
+            meanings = entry.get("meanings", [])
+            
+            definition = "No Definition Found 💔"
+            synonyms_list = []
+
+            if meanings:
+                definition = meanings[0].get("definitions", [{}])[0].get("definition", "No Definition.")
+                for m in meanings:
+                    syns = m.get("synonyms", [])
+                    if syns:
+                        synonyms_list.extend(syns)
+
+            syns_text = ", ".join(synonyms_list[:5]) if synonyms_list else "None Found"
+
+            def capitalize_text(text):
+                return " ".join([word.capitalize() for word in text.split()])
+
+            final_def = capitalize_text(definition)
+            final_syns = capitalize_text(syns_text)
+            final_word = word_query.capitalize()
+
+            msg = (
+                "📖 <b>Intelligence Report</b>\n\n"
+                f"🔍 <b>Target Word:</b> <code>{final_word.upper()}</code>\n\n"
+                "📝 <b>Definition:</b>\n"
+                f"<i>{final_def}</i>\n\n"
+                "🔗 <b>Synonyms:</b>\n"
+                f"<code>{final_syns}</code>\n\n"
+                "💡 <b>Strategic Tip:</b>\n"
+                "Use These Synonyms To Construct Powerful And \n"
+                "Unbreakable Clues For Your Squad. ⚡"
+            )
+
+            await update.message.reply_text(text=msg, parse_mode="HTML")
+
+    except Exception as e:
+        print(f"Dictionary Error: {e}")
+        conn_error_msg = (
+            "⚠️ <b>Connection Failure</b>\n\n"
+            "🚨 <b>System Error:</b> Uplink To The Main \n"
+            "Dictionary Mainframe Failed. Check Logs.\n"
+        )
+        await update.message.reply_text(conn_error_msg, parse_mode="HTML")
+
+async def timerspy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    game = games.get(update.effective_chat.id)
+    if not game or not game["active"]: return
+    if update.effective_user.id != game["creator"]:
+        await update.message.reply_text("❌ <b>Rejected: Only The Game Creator Can Set The Clock!</b> 👑", parse_mode="HTML")
+        return
+
+    try:
+        arg = context.args[0].lower()
+        if arg in ["on", "off"]:
+            game["spy_timer_active"] = (arg == "on")
+            status = "Activated 🟢" if arg == "on" else "Deactivated 🔴"
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id, 
+                text=f"⏲️ <b>Spy Master Clock:</b> {status}", 
+                parse_mode="HTML"
+            )
+        else:
+            t = int(arg)
+            game["spy_timer"] = t
+            game["spy_timer_active"] = True
+            m, s = divmod(t, 60)
+            time_str = f"{m}m {s}s" if m > 0 else f"{s}s"
+            
+            timer_msg = (
+                "⏲️ <b>Spy Master Protocol Set</b>\n\n"
+                f"📡 <b>Transmission Window:</b> <code>{time_str}</code>\n"
+                "🎯 <b>Status:</b> Operational And Active"
+            )
+            
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id, 
+                text=timer_msg, 
+                parse_mode="HTML"
+            )
+    except:
+        usage_msg = (
+            "📝 <b>Usage Format:</b>\n"
+            "• <code>/Timerspy &lt;Seconds&gt;</code>\n"
+            "• <code>/Timerspy On/Off</code>"
+        )
+        await update.message.reply_text(usage_msg, parse_mode="HTML")
+
+async def timerplayer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    game = games.get(update.effective_chat.id)
+    if not game or not game["active"]: return
+    if update.effective_user.id != game["creator"]:
+        await update.message.reply_text("❌ <b>Rejected: Only The Game Creator Can Set The Clock!</b> 👑", parse_mode="HTML")
+        return
+
+    try:
+        arg = context.args[0].lower()
+        if arg in ["on", "off"]:
+            game["player_timer_active"] = (arg == "on")
+            status = "Activated 🟢" if arg == "on" else "Deactivated 🔴"
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id, 
+                text=f"⏲️ <b>Field Agent Clock:</b> {status}", 
+                parse_mode="HTML"
+            )
+        else:
+            t = int(arg)
+            game["player_timer"] = t
+            game["player_timer_active"] = True
+            m, s = divmod(t, 60)
+            time_str = f"{m}m {s}s" if m > 0 else f"{s}s"
+            
+            timer_msg = (
+                "⏲️ <b>Field Agent Protocol Set</b>\n\n"
+                f"⚡ <b>Strike Window:</b> <code>{time_str}</code>\n"
+                "🎯 <b>Status:</b> Operational And Active"
+            )
+            
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id, 
+                text=timer_msg, 
+                parse_mode="HTML"
+            )
+    except:
+        usage_msg = (
+            "📝 <b>Usage Format:</b>\n"
+            "• <code>/Timerplayer &lt;Seconds&gt;</code>\n"
+            "• <code>/Timerplayer On/Off</code>"
+        )
+        await update.message.reply_text(usage_msg, parse_mode="HTML")
+
+async def run_timer(chat_id, context):
+    while chat_id in games and games[chat_id]["active"]:
+        game = games[chat_id]
+        if not game.get("started"):
+            await asyncio.sleep(5)
+            continue
+            
+        is_spy_phase = game.get("clue") is None
+        is_active = game.get("spy_timer_active", False) if is_spy_phase else game.get("player_timer_active", False)
+        
+        if not is_active:
+            await asyncio.sleep(2)
+            continue
+
+        total_seconds = game.get("spy_timer", 60) if is_spy_phase else game.get("player_timer", 60)
+        phase_name = "Intel Transmission" if is_spy_phase else "Tactical Strike"
+        
+        for i in range(total_seconds, 0, -1):
+            if not games.get(chat_id) or not games[chat_id]["active"]: return
+            if (game.get("clue") is None) != is_spy_phase: break 
+            
+            still_active = game.get("spy_timer_active", False) if is_spy_phase else game.get("player_timer_active", False)
+            if not still_active: break
+
+            current_turn = str(game.get('turn', 'Unknown')).upper()
+
+            try:
+                if i > 60 and i % 60 == 0:
+                    mins = i // 60
+                    await context.bot.send_message(chat_id, f"⏳ <b>Status Report:</b> <code>{mins}</code> Minute(s) Remaining\n🚩 <b>Team:</b> {current_turn}\n📡 <b>Phase:</b> <i>{phase_name}</i>", parse_mode="HTML")
+                elif i == 30:
+                    await context.bot.send_message(chat_id, f"⚠️ <b>Urgent:</b> <code>30 Seconds Remaining</code>\n\n🚩 <b>Team {current_turn}</b>, Initiate Your Move <b>Now!</b> ⚡", parse_mode="HTML")
+                elif i <= 10:
+                    countdown_emoji = ["🛑", "➊", "➋", "➌", "➍", "➎", "➏", "➐", "➑", "➒", "➓"]
+                    emoji = countdown_emoji[i] if i < len(countdown_emoji) else "⚠️"
+                    await context.bot.send_message(chat_id, f"<code>{emoji} {i}... System Overload</code>", parse_mode="HTML")
+            except Exception as e:
+                print(f"Timer Alert Error: {e}")
+
+            await asyncio.sleep(1)
+        
+        if games.get(chat_id) and games[chat_id]["active"]:
+            current_clue = game.get("clue")
+            now_active = game.get("spy_timer_active", False) if current_clue is None else game.get("player_timer_active", False)
+            
+            if now_active:
+                old_team = str(game.get('turn', 'BJP')).upper()
+                new_team = "CONGRESS" if old_team == "BJP" else "BJP"
+                
+                reset_all_votes(game)
+
+                if "last_vote_message_id" in game:
+                    try:
+                        reset_text = "🗳️ <b>Voting Reset:</b> No Active Votes For This Turn."
+                        await context.bot.edit_message_text(
+                            chat_id=chat_id,
+                            message_id=game["last_vote_message_id"],
+                            text=reset_text,
+                            parse_mode="HTML"
+                        )
+                    except Exception as e:
+                        print(f"Vote Reset Message Error: {e}")
+                
+                game["turn"] = new_team.upper() 
+                game["clue"] = None
+                game["votes"] = {} 
+                
+                msg = ("⏰ <b>Time Expired: Turn Failed</b>\n\n"
+                       f"🚨 <b>Mission Compromised:</b> Team <b>{old_team}</b> Failed To Act.\n"
+                       "📡 <i>Signal Lost. Force-Transferring Control...</i>\n\n"
+                       f"⚡ <b>Active Control:</b> Team <b>{new_team}</b> Is Now On Field!")
+                try:
+                    await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML")
+                except: pass
+        
+        await asyncio.sleep(1)
+
+async def resend(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    game = games.get(chat_id)
+    user = update.effective_user
+
+    if not game or not game["active"] or not game.get("started"):
+        await update.message.reply_text("❌ Error: No Active Game Found To Resend Data! ⚡")
+        return
+
+    if user.id != game["creator"]:
+        await update.message.reply_text("❌ Rejected: Only The Game Creator Can Resend The Secret Board! 👑")
+        return
+
+    if not context.args:
+        await update.message.reply_text("📝 Usage Format: `/Resend <Team>` (Example: `/Resend Bjp`)")
+        return
+
+    team_input = context.args[0].upper()
+    if team_input not in ["BJP", "CONGRESS"]:
+        team_input = "BJP" if team_input == "Bjp" else "Congress" if team_input == "Congress" else None
+
+    if not team_input:
+        await update.message.reply_text("❌ Invalid Team! Please Use 'Bjp' Or 'Congress'.")
+        return
+
+    spymaster = game["spymasters"].get(team_input)
+    if not spymaster:
+        await update.message.reply_text(f"❌ Error: No Spymaster Assigned For Team {team_input}!")
+        return
+
+    try:
+        spy_id = spymaster.id if hasattr(spymaster, 'id') else spymaster
+        
+        secret_text = board_view(game['board'], user_id=spy_id, game=game)
+        
+        await context.bot.send_message(
+            chat_id=spy_id,
+            text=f"🕵️‍♂️ <b>Secret Board For {team_input} Spymaster:</b>\n\n{secret_text}",
+            parse_mode="HTML"
+        )
+        
+        await context.bot.send_message(  
+            chat_id=spy_id,  
+            text=(
+                f"📡 <b>Intel Retransmission:</b> Your Task Is To Give Clues For Team {team_input} 📑\n\n"
+                "Use <code>/Clue &lt;Word&gt; &lt;Number&gt;</code> To Give Your Next Clue ⚡"
+            ),  
+            parse_mode="HTML"
+        )
+        
+        await update.message.reply_text(f"✅ Success: Secret Board Has Been Resent To {uname(spymaster)} ({team_input}) 📡")
+    except Exception as e:
+        print(f"Resend Error: {e}")
+        await update.message.reply_text(f"🚨 Critical Failure: {uname(spymaster)}, Please Start The Bot In Private Dm First! 🗝️")
+
+async def kick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    game = games.get(chat_id)
+    if not game or not game["active"]: return
+    
+    if update.effective_user.id != game["creator"]:
+        await update.message.reply_text("❌ <b>Territory Denied: Only The Game Creator Can Initiate The Exile Protocol!</b> 👑", parse_mode="HTML")
+        return
+
+    if game["clue"] is not None:
+        await update.message.reply_text("🚫 <b>Action Restricted:</b> Clues Are Already Live. Personnel Changes Are Forbidden During Active Engagement! 🗝️", parse_mode="HTML")
+        return
+
+    try:
+        target = context.args[0]
+        target_id = None
+        for pid, pobj in game["players"].items():
+            if str(pid) == target or uname(pobj) == target:
+                target_id = pid
+                break
+        
+        if target_id:
+            del game["players"][target_id]
+            
+            kick_msg = (
+                "👢 <b>Personnel Exiled From Lobby</b>\n\n"
+                "🚨 <b>Security Breach Neutralized:</b>\n"
+                f"Agent <u>{target}</u> Has Been Forcefully Removed \n"
+                "From The Tactical Lobby.\n\n"
+                "🚩 <b>Status:</b> Exiled By Game Creator\n"
+                "📡 <i>System: Access Codes Revoked.</i>"
+            )
+            await update.message.reply_text(kick_msg, parse_mode="HTML")
+        else:
+            await update.message.reply_text(f"❌ <b>Error:</b> Player <code>{target}</code> Not Found In The Current Lobby!", parse_mode="HTML")
+    except:
+        await update.message.reply_text("📝 <b>Usage Format:</b> <code>/remove &lt;Username/Id&gt;</code>", parse_mode="HTML")
+
+async def wrong(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message.reply_to_message:
+        target_id = update.message.message_id
+    else:
+        target_id = update.message.reply_to_message.message_id
+        
+    Chat_Id = update.effective_chat.id
+    
+    try:
+        await send_wrong_image(context, Chat_Id, target_id)
+    except Exception as e:
+        print(f"Wrong Image Error: {e}")
+        
+    try:
+        await update.message.delete()
+    except:
+        pass
+
+async def fak(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message.reply_to_message:
+        return
+      
+    chat_id = update.effective_chat.id
+    reply_to_id = update.message.reply_to_message.message_id
+    
+    await send_fak_image(context, chat_id, reply_to_id)
+    
+    try:
+        await update.message.delete()
+    except:
+        pass
+
+async def lmao(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message.reply_to_message:
+        return
+      
+    Chat_Id = update.effective_chat.id
+    Reply_To_Id = update.message.reply_to_message.message_id
+    
+    try:
+        await send_lmao_image(context, Chat_Id, Reply_To_Id)
+    except Exception as e:
+        print(f"Lmao Image Error: {e}")
+        
+    try:
+        await update.message.delete()
+    except Exception as e:
+        print(f"Failed To Delete Command: {e}")
+
+async def suicide(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message.reply_to_message:
+        target_id = update.message.message_id
+    else:
+        target_id = update.message.reply_to_message.message_id
+        
+    Chat_Id = update.effective_chat.id
+    
+    try:
+        await send_suicide_image(context, Chat_Id, target_id)
+    except Exception as e:
+        print(f"Suicide Image Error: {e}")
+        
+    try:
+        await update.message.delete()
+    except:
+        pass
+
+async def black(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message.reply_to_message:
+        target_id = update.message.message_id
+    else:
+        target_id = update.message.reply_to_message.message_id
+        
+    Chat_Id = update.effective_chat.id
+    
+    try:
+        await send_black_image(context, Chat_Id, target_id)
+    except Exception as e:
+        print(f"Black Image Error: {e}")
+        
+    try:
+        await update.message.delete()
+    except:
+        pass
+
+async def dena(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message.reply_to_message:
+        target_id = update.message.message_id
+    else:
+        target_id = update.message.reply_to_message.message_id
+        
+    chat_id = update.effective_chat.id
+    
+    try:
+        await send_dena_image(context, chat_id, target_id)
+    except Exception as e:
+        print(f"Dena Image Error: {e}")
+        
+    try:
+        await update.message.delete()
+    except:
+        pass
+
+async def right(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message.reply_to_message:
+        target_id = update.message.message_id
+    else:
+        target_id = update.message.reply_to_message.message_id
+        
+    Chat_Id = update.effective_chat.id
+    
+    try:
+        await send_right_image(context, Chat_Id, target_id)
+    except Exception as e:
+        print(f"Right Image Error: {e}")
+        
+    try:
+        await update.message.delete()
+    except:
+        pass
+        
+async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        pipeline = [
+            {
+                "$match": {
+                    "name": {"$not": {"$regex": "Dummy", "$options": "i"}},
+                    "$or": [{"wins": {"$gt": 0}}, {"win": {"$gt": 0}}, {"coins": {"$gt": 0}}]
+                }
+            },
+            {
+                "$addFields": {
+                    "total_wins": {
+                        "$add": [
+                            {"$toInt": {"$ifNull": ["$wins", 0]}},
+                            {"$toInt": {"$ifNull": ["$win", 0]}}
+                        ]
+                    },
+                    "numeric_coins": {"$toInt": {"$ifNull": ["$coins", 0]}}
+                }
+            },
+            {"$sort": {"total_wins": -1, "numeric_coins": -1}},
+            {"$limit": 10}
+        ]
+
+        top_players = list(collection.aggregate(pipeline))
+
+        if not top_players:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="<code>📉 Database Empty: No Legends Detected.</code>",
+                parse_mode="HTML"
+            )
+            return
+
+        msg = (
+            "🏆 <b>Elite Agents Leaderboard</b> 🏆\n\n"
+            "📡 <b>Top Rankings Detected:</b>\n\n"
+        )
+        
+        for i, data in enumerate(top_players, 1):
+            name = data.get("name", "Unknown Agent")
+            coins = data.get("numeric_coins", 0)
+            actual_wins = data.get("total_wins", 0)
+            
+            title = get_achievement_title(data)
+            medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"<b>{i}.</b>"
+            clean_name = str(name).replace("<", "&lt;").replace(">", "&gt;")
+            
+            msg += f"{medal} <b>{clean_name}</b> | <i>{title}</i>\n"
+            msg += f"<code>   ┗━ 🪙 {coins} Coins | 🏆 {actual_wins} Wins</code>\n\n"
+        
+        msg += "<i>Keep Fighting To Climb The Ranks!</i>\n"
+        msg += "📡 <i>Data Synced With Central Command.</i>"
+
+        await context.bot.send_message(chat_id=update.effective_chat.id, text=msg, parse_mode="HTML")
+
+    except Exception as e:
+        print(f"Leaderboard Error: {e}")
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id, 
+            text="❌ <b>System Error:</b> Standings Currently Unavailable.", 
+            parse_mode="HTML"
+        )
+
+async def givecoins(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.username != "bhawanisinghshekhawatt":
+        await update.message.reply_text("❌ RESTRICTED PERMISSION: Only @bhawanisinghshekhawatt Can Authorize Transactions! 💸")
+        return
+        
+    try:
+        if len(context.args) < 2:
+            await update.message.reply_text("📝 Usage: /givecoins <UserID/Username> <Amount>")
+            return
+          
+        target_input = context.args[0].replace("@", "")
+        amount = int(context.args[1])
+        uid = None
+        
+        if target_input.isdigit():
+            uid = int(target_input)
+        else:
+            user_in_db = collection.find_one({"username": {"$regex": f"^{target_input}$", "$options": "i"}})
+            if user_in_db:
+                uid = user_in_db["_id"]
+            else:
+                for user_id, stats in user_stats.items():
+                    if stats.get("username", "").lower() == target_input.lower():
+                        uid = user_id
+                        break
+                      
+        if not uid:
+            await update.message.reply_text("❌ Agent Not Found! Database mein records nahi mile.")
+            return
+          
+        result = collection.find_one_and_update(
+            {"_id": uid},
+            {"$inc": {"coins": amount}},
+            upsert=True,
+            return_document=True
+        )
+        
+        new_balance = result.get("coins", 0)
+        if uid not in user_stats:
+            user_stats[uid] = {
+                "coins": new_balance, 
+                "wins": result.get("wins", 0), 
+                "name": result.get("name", f"Agent {uid}"),
+                "username": result.get("username", "")
+            }
+        else:
+            user_stats[uid]["coins"] = new_balance
+            
+        display_name = result.get("name", f"Agent {uid}")
+        success_msg = (
+            "💰 FINANCIAL TRANSFER SUCCESSFUL 💰\n\n"
+            f"👤 Target: {display_name}\n"
+            f"🆔 ID: {uid}\n"
+            f"💵 Added: {amount} Coins\n"
+            f"🏦 New Balance: {new_balance} Coins\n\n"
+            "📡 Transaction confirmed by Central Command."
+        )
+        
+        await update.message.reply_text(success_msg)
+        
+    except ValueError:
+        await update.message.reply_text("❌ Error: Amount ek sahi number hona chahiye!")
+    except Exception as e:
+        print(f"Givecoins Error: {e}")
+        await update.message.reply_text("❌ Critical Error: Transaction Interrupted!")
+
+async def handle_stickers(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    game = games.get(update.effective_chat.id)
+    if game and game.get("active"):
+        try:
+            await update.message.delete()
+        except:
+            pass
+
+async def block_spams(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    game = games.get(chat_id)
+    
+    if game and game.get("active") and game.get("started"):
+      
+        if update.message.animation:
+            try:
+                await update.message.delete()
+            except Exception as e:
+                print(f"Error deleting GIF: {e}")
+            return
+
+async def handle_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    game = games.get(update.effective_chat.id)
+    
+    if game and game.get("active"):
+        message = update.effective_message
+        
+        if message.entities:
+            for entity in message.entities:
+                if entity.type in ["url", "text_link"]:
+                    try:
+                        await message.delete()
+                    except:
+                        pass
+                    return
+
+async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    game = games.get(chat_id)
+    
+    if not game or not game.get("active"):
+        await update.message.reply_text("❌ <b>No Active Games Found!</b>", parse_mode="HTML")
+        return
+      
+    if update.effective_user.id not in [game.get("creator"), game.get("starter_id")]:
+        await update.message.reply_text("🚫 <b>Access Denied:</b> Only The Supreme Leader Can Add Agents! ⚡", parse_mode="HTML")
+        return
+      
+    if len(context.args) < 2:
+        await update.message.reply_text("📝 <b>Usage Protocol:</b> <code>/Adduser &lt;Bjp/Congress&gt; &lt;Username/Userid&gt;</code>", parse_mode="HTML")
+        return
+      
+    team_input = context.args[0].capitalize()
+    if team_input == "Bjp": team_input = "BJP" 
+    
+    user_input = context.args[1].replace("@", "")
+    
+    if team_input not in ["BJP", "Congress"]:
+        await update.message.reply_text("❌ <b>Invalid Team:</b> Please Use 'Bjp' Or 'Congress'.", parse_mode="HTML")
+        return
+      
+    target_user = None
+    target_id = None
+    
+    if user_input.isdigit():
+        target_id = int(user_input)
+    else:
+        for uid, stats in user_stats.items():
+            if stats.get("username", "").lower() == user_input.lower():
+                target_id = uid
+                break
+              
+    if target_id:
+        try:
+            member = await context.bot.get_chat_member(chat_id, target_id)
+            target_user = member.user
+        except: 
+            pass
+          
+    if not target_user:
+        await update.message.reply_text("❌ <b>User Not Found:</b> Ask The Player To Send A Message In The Group First.", parse_mode="HTML")
+        return
+      
+    if target_user.id in game["players"]:
+        await update.message.reply_text(f"⚠️ <b>{target_user.first_name}</b> Is Already Part Of The Game! 🎯", parse_mode="HTML")
+        return
+      
+    game["players"][target_user.id] = target_user
+    game["teams"][team_input].append(target_user.id)
+    
+    reinforcement_msg = (
+        "✅ <b>Reinforcements Arrived</b>\n\n"
+        "📡 <b>New Unit Deployment Complete:</b>\n\n"
+        f"👤 <b>Agent:</b> <u>{target_user.first_name}</u>\n"
+        f"🚩 <b>Assigned To:</b> Team {team_input.upper()}\n"
+        "🫡 <b>Authority:</b> Supreme Leader\n\n"
+        "⚡ <i>Status: Bio Sync Complete. Agent Is Ready For Strike.</i>"
+    )
+    await update.message.reply_text(text=reinforcement_msg, parse_mode="HTML")
+
+async def remove_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    game = games.get(chat_id)
+    
+    if not game or not game.get("active"):
+        await update.message.reply_text("❌ <b>Error:</b> No Active Games Found!")
+        return
+        
+    if update.effective_user.id not in [game.get("creator"), game.get("starter_id")]:
+        await update.message.reply_text("🚫 <b>Access Denied:</b> Only The Game Creator Can Discharge The Agents! ⚡")
+        return
+
+    if len(context.args) < 2:
+        usage_msg = (
+            "📝 <b>Usage Format:</b>\n"
+            "<code>/Removeuser &lt;Team&gt; &lt;Username/Userid&gt;</code>\n"
+            "Example: <code>/Removeuser Bjp @Agent_X</code>"
+        )
+        await update.message.reply_text(usage_msg, parse_mode="HTML")
+        return
+
+    raw_team = context.args[0].upper()
+    team_key = "BJP" if raw_team == "BJP" else "Congress" if raw_team == "CONGRESS" else None
+
+    if not team_key:
+        await update.message.reply_text("❌ <b>Invalid Team:</b> Please Use 'Bjp' Or 'Congress'.")
+        return
+
+    user_input = context.args[1].replace("@", "").lower()
+    target_id = None
+
+    team_list = game["teams"].get(team_key, [])
+    
+    if user_input.isdigit():
+        target_id = int(user_input)
+    else:
+        for p in team_list:
+            p_username = getattr(p, 'username', '') if hasattr(p, 'username') else ""
+            p_id = getattr(p, 'id', p) if hasattr(p, 'id') else p
+            
+            if p_username and p_username.lower() == user_input:
+                target_id = p_id
+                break
+
+    if not target_id:
+        await update.message.reply_text(f"❌ <b>Error:</b> Could Not Find That Agent In Team: {team_key}.")
+        return
+
+    current_spy = game["spymasters"].get(team_key)
+    spy_id = getattr(current_spy, 'id', current_spy) if hasattr(current_spy, 'id') else current_spy
+    
+    if target_id == spy_id:
+        await update.message.reply_text("⚠️ <b>Restriction:</b> Cannot Remove A Spymaster! Reassign Roles First.")
+        return
+
+    if target_id in game["players"]:
+        del game["players"][target_id]
+    
+    game["teams"][team_key] = [
+        p for p in team_list 
+        if (getattr(p, 'id', p) if hasattr(p, 'id') else p) != target_id
+    ]
+
+    discharge_msg = (
+        "🚷 <b>Agent Discharged</b>\n\n"
+        "🚨 <b>Personnel Update:</b>\n"
+        "An Agent Has Been Officially Removed From Tactical \n"
+        "Operations And Stripped Of All Ranks.\n\n"
+        f"🚩 <b>Former Team:</b> {team_key.upper()}\n"
+        "⚡ <b>Authority:</b> The Game Creator\n\n"
+        "📡 <i>System: Personnel File Moved To Archive.</i>"
+    )
+    
+    await update.message.reply_text(
+        text=discharge_msg,
+        parse_mode="HTML"
+    )
+
+async def inventory(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    Uid = update.effective_user.id
+    
+    if Uid not in user_stats or not user_stats[Uid].get("inventory"):
+        empty_msg = (
+            "🎒 <b>Inventory Empty</b>\n\n"
+            "⚠️ <b>Access Denied:</b> No Tactical Gear Detected.\n"
+            "💡 <i>Visit The <b>/Shop</b> To Acquire Strategic Assets.</i>"
+        )
+        await update.message.reply_text(empty_msg, parse_mode="HTML")
+        return
+
+    Inv = user_stats[Uid]["inventory"]
+    from collections import Counter
+    Counts = Counter(Inv)
+    
+    Msg = (
+        "🎖️ <b>Tactical Arsenal</b>\n\n"
+        f"👤 <b>Operative:</b> <u>{uname(update.effective_user)}</u>\n"
+        "━━━━━━━━━━━━━━━━━━━\n\n"
+    )
+    
+    for Item, Count in Counts.items():
+        Item_Id = "N/A"
+        for Id, Info in SHOP_ITEMS.items():
+            if Info["name"] == Item:
+                Item_Id = Id
+                break
+        
+        Msg += f"📦 <b>Gear:</b> <code>{Item.upper()}</code>\n"
+        Msg += f"🆔 <b>Access Code:</b> <code>{Item_Id}</code>\n"
+        Msg += f"🔋 <b>Stock:</b> <code>{Count}</code> Units\n"
+        Msg += "┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈\n"
+    
+    Msg += (
+        "\n⚡ <b>Tactical Deployment:</b>\n"
+        "Use <code>/Use &lt;Id&gt;</code> During An Active Mission \n"
+        "To Activate Your Strategic Gear.\n\n"
+        "🛰️ <i>System: Hardware Status Nominal.</i>"
+    )
+    
+    await update.message.reply_text(Msg, parse_mode="HTML")
+
+async def shop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    Msg = (
+        "⚔️ <b>Tactical Weapons Depot</b> ⚔️\n\n"
+        "📡 <b>Black Market Access Granted</b>\n"
+        "━━━━━━━━━━━━━━━━━━━\n\n"
+    )
+    
+    for Id, Item in SHOP_ITEMS.items():
+        Msg += f"📦 <b>Gear:</b> <code>{Item['name'].upper()}</code>\n"
+        Msg += f"🆔 <b>Item Code:</b> <code>{Id}</code>\n"
+        Msg += f"💰 <b>Price:</b> <code>{Item['price']}</code> <b>Coins</b>\n"
+        Msg += f"📝 <b>Intel:</b> <i>{Item['desc']}</i>\n"
+        Msg += "┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈\n"
+    
+    Msg += (
+        "\n🎯 <b>Arsenal Upgrade:</b>\n"
+        "Use <code>/Buy &lt;Item_Code&gt;</code> To Purchase Your Gear.\n\n"
+        "🛰️ <i>System: Gear Up For The Next Strike.</i>"
+    )
+    
+    await update.message.reply_text(Msg, parse_mode="HTML")
+
+async def use(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    Uid = update.effective_user.id
+    Chat_Id = update.effective_chat.id
+    Game = games.get(Chat_Id)
+    
+    if not Game or not Game.get("active"):
+        inactive_msg = (
+            "❌ <b>War Zone Inactive</b>\n\n"
+            "🚨 <b>Error:</b> Tactical Gears Can Only Be \n"
+            "Deployed During An Active Mission.\n"
+        )
+        await update.message.reply_text(inactive_msg, parse_mode="HTML")
+        return
+
+    Is_Player = False
+    for P in Game.get("players", {}).values():
+        Pid = P.id if hasattr(P, 'id') else P
+        if Pid == Uid:
+            Is_Player = True
+            break
+            
+    if not Is_Player:
+        deny_msg = (
+            "🚫 <b>Access Denied</b>\n\n"
+            "🚨 <b>Unauthorized:</b> Only Active Combatants \n"
+            "Of This Mission Can Utilize Tactical Assets.\n"
+        )
+        await update.message.reply_text(deny_msg, parse_mode="HTML")
+        return
+
+    Current_Spymasters = [getattr(S, 'id', S) if not isinstance(S, int) else S for S in Game.get("spymasters", {}).values()]
+    if Uid in Current_Spymasters:
+        spy_deny = (
+            "🚫 <b>Intel Restriction</b>\n\n"
+            "🚨 <b>Policy:</b> Spymasters Are Strictly Restricted \n"
+            "From Using Tactical Gears To Maintain Neutrality.\n"
+        )
+        await update.message.reply_text(spy_deny, parse_mode="HTML")
+        return
+
+    if Uid not in user_stats or not user_stats[Uid].get("inventory"):
+        empty_bag = (
+            "🎒 <b>Empty Bag</b>\n\n"
+            "🚨 <b>Status:</b> Your Tactical Storage Is Empty. \n"
+            "Visit The <b>/Shop</b> To Acquire New Assets.\n"
+        )
+        await update.message.reply_text(empty_bag, parse_mode="HTML")
+        return
+        
+    try:
+        Item_Choice = context.args[0]
+    except:
+        usage_msg = (
+            "📝 <b>Usage Protocol</b>\n\n"
+            "🚨 <b>Command:</b> <code>/Use &lt;Item_Id&gt;</code>\n"
+            "💡 <b>Example:</b> <code>/Use 1</code>\n"
+        )
+        await update.message.reply_text(usage_msg, parse_mode="HTML")
+        return
+
+    Item_Info = SHOP_ITEMS.get(Item_Choice)
+    if not Item_Info or Item_Info["name"] not in user_stats[Uid]["inventory"]:
+        inv_err = (
+            "❌ <b>Inventory Error</b>\n\n"
+            "🚨 <b>Rejection:</b> Target Gear Not Found In \n"
+            "Your Current Inventory Loadout.\n"
+        )
+        await update.message.reply_text(inv_err, parse_mode="HTML")
+        return
+
+    Item_Name = Item_Info["name"]
+
+    if Item_Choice == "1":
+        Neutrals = [W for W, V in Game["board"].items() if (V.get("role") == "Neutral" or V.get("team") == "Neutral") and not V.get("revealed")]
+        if Neutrals:
+            Word = random.choice(Neutrals)
+            Game["board"][Word]["revealed"] = True
+            user_stats[Uid]["inventory"].remove(Item_Name)
+            save_stats_to_db(Uid)
+            success_msg = (
+                "🔍 <b>Intel Lens Activated</b>\n\n"
+                "📡 <b>Scanning Battlefield... Data Found!</b>\n\n"
+                "🎯 <b>Neutral Identity Exposed:</b>\n"
+                f"The Word <code>{Word.upper()}</code> Has Been Identified \n"
+                "As A <b>Neutral Target</b> (Civilian).\n\n"
+                "⚡ <i>Recon: Target Location Marked On The Grid.</i>"
+            )
+            await update.message.reply_text(text=success_msg, parse_mode="HTML")
+        else:
+            failure_msg = (
+                "❌ <b>Reconnaissance Failure</b>\n\n"
+                "🚨 <b>Error: Targets Not Found</b>\n\n"
+                "No Neutral Targets Left To Reveal In The Current Ao.\n\n"
+                "📡 <i>System: Scanning Halted. Intel Exhausted.</i>"
+            )
+            await update.message.reply_text(text=failure_msg, parse_mode="HTML")
+
+    elif Item_Choice == "2":
+        Game["shield_active"] = True
+        user_stats[Uid]["inventory"].remove(Item_Name)
+        save_stats_to_db(Uid)
+        armor_msg = (
+            "🛡️ <b>Body Armor Equipped</b>\n\n"
+            "🛰️ <b>Defensive Protocol Activated</b>\n\n"
+            "Your Squad Has Deployed <b>Level-Iii Ballistic Armor</b>. \n"
+            "You Are Now <b>Protected</b> From The Next 🏴‍☠️ Assassin Strike.\n\n"
+            "⚠️ <b>Status:</b> Shield Active (Single Use)\n"
+            "⚡ <i>Recon: Death Word Impact Will Be Neutralized.</i>"
+        )
+        await update.message.reply_text(text=armor_msg, parse_mode="HTML")
+
+    elif Item_Choice == "3":
+        try:
+            Target_Word = " ".join(context.args[1:]).strip().upper()
+            Actual_Key = next((K for K in Game["board"].keys() if K.upper() == Target_Word), None)
+            
+            if Actual_Key:
+                Role = Game["board"][Actual_Key].get("team", Game["board"][Actual_Key].get("role", "Unknown"))
+                user_stats[Uid]["inventory"].remove(Item_Name)
+                save_stats_to_db(Uid)
+                spy_eye_report = (
+                    "🕵️ <b>Spy Eye: Intel Report</b>\n\n"
+                    "📡 <b>Decrypting Target Data...</b>\n\n"
+                    f"🔍 <b>Word:</b> <code>{Actual_Key.upper()}</code>\n"
+                    f"🎭 <b>Identity:</b> <b>{Role.upper()}</b>\n\n"
+                    "⚠️ <i>Burn This Message After Reading. Do Not \n"
+                    "Leak This To The Enemy Team!</i>"
+                )
+                await context.bot.send_message(chat_id=Uid, text=spy_eye_report, parse_mode="HTML")
+                group_announcement = (
+                    "🕵️ <b>Spy Eye Deployed!</b>\n\n"
+                    f"Agent <u>{uname(update.effective_user)}</u> Has Successfully \n"
+                    "Intercepted Private Battlefield Data.\n\n"
+                    "📑 <b>Status:</b> Check Your Private Feed For Intel.\n"
+                    "🛰️ <i>System: Satellite Link Secure.</i>"
+                )
+                await update.message.reply_text(group_announcement, parse_mode="HTML")
+            else:
+                target_error = (
+                    "❌ <b>Target Error:</b>\n"
+                    f"Word <code>{Target_Word}</code> Not Found On The Grid!\n"
+                )
+                await update.message.reply_text(target_error, parse_mode="HTML")
+        except Exception:
+            usage_error = (
+                "📝 <b>Usage Protocol:</b>\n"
+                "<code>/Use 3 &lt;Word&gt;</code>\n"
+            )
+            await update.message.reply_text(usage_error, parse_mode="HTML")
+
+    elif Item_Choice == "4":
+        if Game.get("clue"):
+            Game["left"] = Game.get("left", 0) + 1
+            user_stats[Uid]["inventory"].remove(Item_Name)
+            save_stats_to_db(Uid)
+            success_msg = (
+                "⚡ <b>Tactical Boost Active</b>\n\n"
+                "🛰️ <b>Operation Overdrive:</b>\n"
+                "Your Squad Has Been Granted An <b>Extra Strike</b>! \n"
+                f"📊 <b>Operations Left:</b> <code>{Game['left']}</code>\n\n"
+                "🎖️ <i>Status: Rapid Deployment Authorized.</i>"
+            )
+            await update.message.reply_text(text=success_msg, parse_mode="HTML")
+        else:
+            failure_msg = (
+                "❌ <b>Strategic Delay</b>\n\n"
+                "🚨 <b>Command Error:</b> Wait For A <b>Clue</b> From Your \n"
+                "Spymaster Before Using The Extra Move.\n"
+            )
+            await update.message.reply_text(text=failure_msg, parse_mode="HTML")
+
+    elif Item_Choice == "5":
+        Game["multiplier_user"] = Uid
+        user_stats[Uid]["inventory"].remove(Item_Name)
+        save_stats_to_db(Uid)
+        multiplier_msg = (
+            "💰 <b>Coin Multiplier Active</b>\n\n"
+            "🛰️ <b>Financial Boost Engaged:</b>\n"
+            "Your Potential Payout Is Now <b>Doubled</b>.\n\n"
+            "🏆 <b>Stipulation:</b> Victory Must Be Achieved.\n"
+            "⚡ <i>Status: Wealth Accumulation Optimized.</i>"
+        )
+        await update.message.reply_text(text=multiplier_msg, parse_mode="HTML")
+
+async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    
+    # Database se fresh coins fetch karna taaki coin error na aaye
+    current_data = collection.find_one({"_id": uid})
+    db_coins = current_data.get("coins", 0) if current_data else 0
+    
+    if uid not in user_stats:
+        user_stats[uid] = {"coins": db_coins, "wins": 0, "name": uname(update.effective_user), "inventory": []}
+    else:
+        user_stats[uid]["coins"] = db_coins
+
+    try:
+        item_id = context.args[0]
+        item = SHOP_ITEMS.get(item_id)
+        if not item: raise ValueError
+    except:
+        usage = (
+            "📝 <b>Usage Protocol:</b>\n"
+            "<code>/Buy &lt;Item_Id&gt;</code>\n"
+            "💡 <b>Example:</b> <code>/Buy 1</code>"
+        )
+        await update.message.reply_text(usage, parse_mode="HTML")
+        return
+
+    # Fresh balance check
+    if user_stats[uid]["coins"] < item["price"]:
+        diff = item["price"] - user_stats[uid]["coins"]
+        reject_msg = (
+            "📉 <b>Transaction Rejected</b>\n\n"
+            f"🚨 <b>Credit Deficit:</b> You Need 🪙 <code>{diff}</code> \n"
+            f"More Coins To Purchase <b>{item['name']}</b>.\n"
+        )
+        await update.message.reply_text(reject_msg, parse_mode="HTML")
+        return
+
+    user_stats[uid]["coins"] -= item["price"]
+    if "inventory" not in user_stats[uid]:
+        user_stats[uid]["inventory"] = []
+    
+    user_stats[uid]["inventory"].append(item["name"])
+    
+    # Database Update
+    collection.update_one(
+        {"_id": uid}, 
+        {"$push": {"inventory": item["name"]}, "$inc": {"coins": -item["price"]}}, 
+        upsert=True
+    )
+
+    purchase_msg = (
+        "✅ <b>Purchase Successful</b>\n\n"
+        f"📦 <b>Gear Acquired:</b> <code>{item['name'].upper()}</code>\n"
+        f"💰 <b>Funds Deducted:</b> 🪙 <code>{item['price']}</code>\n"
+        f"💳 <b>Remaining Credit:</b> 🪙 <code>{user_stats[uid]['coins']}</code>\n\n"
+        "🎒 <b>Action:</b> Check Your <code>/Inventory</code> To Deploy.\n"
+    )
+    await update.message.reply_text(text=purchase_msg, parse_mode="HTML")
+
+async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user_data = collection.find_one({"_id": uid})
+
+    if not user_data:
+        user_data = {
+            "_id": uid, 
+            "coins": 0, 
+            "wins": 0, 
+            "inventory": [], 
+            "name": update.effective_user.first_name
+        }
+        collection.insert_one(user_data)
+        await update.message.reply_text("❌ <b>No Record Found:</b> Join A Game First To Create Your Game Profile!")
+        return
+
+    total_wins = int(user_data.get("wins", 0)) + int(user_data.get("win", 0))
+
+    higher_players = collection.count_documents({"coins": {"$gt": user_data.get("coins", 0)}})
+    rank = higher_players + 1
+
+    medal = "🥇" if rank == 1 else "🥈" if rank == 2 else "🥉" if rank == 3 else "🏅"
+    
+    temp_data = user_data.copy()
+    temp_data["wins"] = total_wins 
+    achievement = get_achievement_title(temp_data)
+
+    inv = user_data.get("inventory", [])
+    gear_count = len(inv)
+
+    msg = (
+        "🎖️ <b>Warrior Service Record</b>\n\n"
+        f"👤 <b>Name:</b> <u>{user_data.get('name', 'Unknown Agent')}</u>\n"
+        f"🆔 <b>Agent Id:</b> <code>{uid}</code>\n"
+        "━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🎖️ <b>Achievement:</b> <i>{achievement}</i>\n"
+        f"🏆 <b>War Victories:</b> <code>{total_wins}</code> Wins\n"
+        f"🪙 <b>Total Wealth:</b> <code>{user_data.get('coins', 0)}</code> Coins\n"
+        f"{medal} <b>Global Rank:</b> <code>#{rank}</code>\n"
+        f"🎒 <b>Owned Gears:</b> <code>{gear_count}</code> Items\n\n"
+        "━━━━━━━━━━━━━━━━━━━\n"
+        "🔥 <i>Keep Fighting To Reach The Top, Soldier. 🎩</i>\n"
+        "📡 <i>Status: Combat Ready.</i>"
+    )
+    
+    await update.message.reply_text(text=msg, parse_mode="HTML")
+
+async def team_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    game = games.get(chat_id)
+    
+    if not game or not game.get("active"):
+        await update.message.reply_text("❌ <b>No Active Mission:</b> Start One With <code>/Startgame</code>", parse_mode="HTML")
+        return
+
+    async def get_safe_name(p):
+        if not p: return "Not Assigned"
+        
+        # 1. Agar p pehle se User Object hai
+        if hasattr(p, 'first_name'):
+            return p.first_name
+            
+        # 2. Agar p sirf ID (Integer) hai
+        p_id = p if isinstance(p, int) else getattr(p, 'id', None)
+        
+        if not p_id: return "Unknown Agent"
+
+        # 3. Game memory se check karo
+        cached_user = game["players"].get(p_id)
+        if cached_user and hasattr(cached_user, 'first_name'):
+            return cached_user.first_name
+
+        # 4. Last option: API se fetch karo
+        try:
+            member = await context.bot.get_chat_member(chat_id, p_id)
+            return member.user.first_name
+        except:
+            return "Unknown Agent"
+
+    bjp_list = game.get("teams", {}).get("BJP", [])
+    con_list = game.get("teams", {}).get("Congress", [])
+    
+    # Names fetch karna
+    bjp_names = []
+    for p in bjp_list:
+        name = await get_safe_name(p)
+        bjp_names.append(name)
+        
+    con_names = []
+    for p in con_list:
+        name = await get_safe_name(p)
+        con_names.append(name)
+    
+    bjp_members = ", ".join(bjp_names) or "None"
+    con_members = ", ".join(con_names) or "None"
+    
+    bjp_spy_id = game.get("spymasters", {}).get("BJP")
+    con_spy_id = game.get("spymasters", {}).get("Congress")
+
+    bjp_spy_name = await get_safe_name(bjp_spy_id)
+    con_spy_name = await get_safe_name(con_spy_id)
+
+    msg = (
+        "🎖️ <b>Current Battlelines</b>\n\n"
+        "📡 <b>Squad Deployment Status:</b>\n\n"
+        "🪷 <b>Team Bjp:</b>\n"
+        f"👥 <b>Units:</b> <code>{bjp_members}</code>\n"
+        f"🕵️ <b>Spymaster:</b> <u>{bjp_spy_name}</u>\n\n"
+        "🪬 <b>Team Congress:</b>\n"
+        f"👥 <b>Units:</b> <code>{con_members}</code>\n"
+        f"🕵️ <b>Spymaster:</b> <u>{con_spy_name}</u>\n\n"
+        "━━━━━━━━━━━━━━━━━━━\n"
+        f"🚩 <b>Active Control:</b> <code>Team {str(game.get('turn', 'Waiting')).upper()}</code>\n"
+        "🛰️ <i>System: Monitor All Frequencies.</i>"
+    )
+    await update.message.reply_text(
+        text=msg,
+        disable_web_page_preview=True,
+        parse_mode="HTML"
+    )
+
+async def add_dummy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    game = games.get(chat_id)
+
+    if not game or not game.get("active"):
+        await update.message.reply_text("❌ <b>No Active Mission:</b> Start One With <code>/Startgame</code> First 🥇")
+        return
+        
+    if update.effective_user.id not in [game.get("creator"), game.get("starter_id")]:
+        await update.message.reply_text("🚫 <b>Access Denied:</b> Only The Game Creator Can Add Dummy Agents! ⚡")
+        return
+
+    if not context.args:
+        usage_msg = (
+            "📝 <b>Usage Protocol:</b>\n"
+            "<code>/Adddummy &lt;Agent Name&gt;</code>\n"
+            "Example: <code>/Adddummy Secret Agent 007</code>"
+        )
+        await update.message.reply_text(usage_msg, parse_mode="HTML")
+        return
+
+    dummy_name = " ".join(context.args)
+    
+    import random
+    dummy_id = random.randint(-999999, -1000)
+
+    class DummyUser:
+        def __init__(self, id, name):
+            self.id = id
+            self.first_name = name
+            self.username = name.replace(" ", "_").lower()
+            self.is_bot = False
+
+    new_dummy = DummyUser(dummy_id, dummy_name)
+
+    if "dummy_players" not in game:
+        game["dummy_players"] = []
+    
+    if isinstance(game["players"], set):
+        game["players"].add(new_dummy.id)
+    else:
+        game["players"][new_dummy.id] = new_dummy
+        
+    game["dummy_players"].append(new_dummy)
+    
+    dummy_msg = (
+        "🤖 <b>Dummy Agent Deployed</b>\n\n"
+        "📡 <b>Automated Unit Initialized</b>\n\n"
+        f"👤 <b>Designation:</b> <u>{dummy_name}</u>\n"
+        f"🆔 <b>Serial Id:</b> <code>{dummy_id}</code>\n"
+        "🫡 <b>Status:</b> <code>Ready For Assignment</code>\n\n"
+        "⚡ <i>System: Ai Controlled Unit Online.</i>"
+    )
+    await update.message.reply_text(
+        text=dummy_msg,
+        parse_mode="HTML"
+    )
+
+async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    Allowed_Username = "bhawanisinghshekhawatt"
+    Current_User = update.effective_user.username
+    
+    if not Current_User or Current_User.lower() != Allowed_Username.lower():
+        denied_msg = (
+            "<code>┏━━━━━━━━━━━━━━━━━━━━━━━━━━━┓</code>\n"
+            "<code>     🚫 ACCESS DENIED               </code>\n"
+            "<code>┗━━━━━━━━━━━━━━━━━━━━━━━━━━━┛</code>\n\n"
+            "🚨 <b>ERROR:</b> RESTRICTED COMMAND.\n"
+            "This action requires <b>Supreme Leader</b> \n"
+            "clearance (Bot Owner Only).\n\n"
+            "📡 <i>System: Security breach logged.</i>"
+        )
+        await update.message.reply_text(denied_msg, parse_mode="HTML")
+        return
+      
+    if not context.args:
+        usage_msg = (
+            "<code>┏━━━━━━━━━━━━━━━━━━━━━━━━━━━┓</code>\n"
+            "<code>     📝 BROADCAST PROTOCOL          </code>\n"
+            "<code>┗━━━━━━━━━━━━━━━━━━━━━━━━━━━┛</code>\n\n"
+            "🚨 <b>COMMAND:</b> <code>/broadcast &lt;Message&gt;</code>\n"
+            "💡 <b>TIP:</b> Use <code>/n</code> for a new line.\n"
+        )
+        await update.message.reply_text(usage_msg, parse_mode="HTML")
+        return
+      
+    Raw_Msg = " ".join(context.args)
+    Formatted_Msg = Raw_Msg.replace("/n", "\n")
+    
+    context.user_data['pending_broadcast'] = Formatted_Msg
+    
+    try:
+        Broadcast_Data = collection.find_one({"_id": "broadcast_list"})
+    except:
+        Broadcast_Data = None
+    
+    Total_Chats = list(Broadcast_Data["chat_ids"]) if Broadcast_Data and "chat_ids" in Broadcast_Data else []
+    for Cid in list(games.keys()):
+        if Cid not in Total_Chats: Total_Chats.append(Cid)
+
+    if not Total_Chats:
+        await update.message.reply_text("🚨 <b>ERROR:</b> No active targets found.", parse_mode="HTML")
+        return
+      
+    keyboard = []
+    keyboard.append([InlineKeyboardButton("🚀 SEND TO ALL GROUPS", callback_data="bc_all")])
+    
+    for Chat_Id in Total_Chats:
+        try:
+            chat_info = await context.bot.get_chat(Chat_Id)
+            title = chat_info.title if chat_info.title else f"ID: {Chat_Id}"
+            keyboard.append([InlineKeyboardButton(f"📡 {title}", callback_data=f"bc_{Chat_Id}")])
+        except:
+            continue
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(
+        "🎯 <b>SELECT TARGET DESTINATION:</b>\n"
+        "Choose where you want to transmit the signal.",
+        reply_markup=reply_markup,
+        parse_mode="HTML"
+    )
+
+async def broadcast_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    data = query.data
+    msg_to_send = context.user_data.get('pending_broadcast')
+    
+    if not msg_to_send:
+        await query.edit_message_text("❌ <b>ERROR:</b> Broadcast message expired. Try again.", parse_mode="HTML")
+        return
+      
+    targets = []
+    if data == "bc_all":
+        try: Broadcast_Data = collection.find_one({"_id": "broadcast_list"})
+        except: Broadcast_Data = None
+        targets = list(Broadcast_Data["chat_ids"]) if Broadcast_Data and "chat_ids" in Broadcast_Data else []
+        for Cid in list(games.keys()):
+            if Cid not in targets: targets.append(Cid)
+    else:
+        chat_id = data.replace("bc_", "")
+        targets = [chat_id]
+
+    success_count = 0
+    for tid in targets:
+        try:
+            if tid == "broadcast_list": continue
+            await context.bot.send_message(chat_id=tid, text=msg_to_send, parse_mode="Markdown")
+            success_count += 1
+        except: continue
+      
+    final_report = (
+        f"<code>┏━━━━━━━━━━━━━━━━━━━━━━━━━━━┓</code>\n"
+        f"<code>     ✅ BROADCAST COMPLETE          </code>\n"
+        f"<code>┗━━━━━━━━━━━━━━━━━━━━━━━━━━━┛</code>\n\n"
+        f"🚀 <b>SENT TO:</b> <code>{success_count}</code> Groups\n"
+        f"📊 <b>STATUS:</b> Signals Delivered\n\n"
+        f"⚡ <i>System: Satellite link disconnected.</i>"
+    )
+    await query.edit_message_text(final_report, parse_mode="HTML")
+
+async def resetstats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    allowed_username = "bhawanisinghshekhawatt"
+    current_user = update.effective_user.username
+
+    if not current_user or current_user.lower() != allowed_username.lower():
+        denied_msg = "🚫 <b>Access Denied: Restricted To Bot Owner</b>"
+        await update.message.reply_text(denied_msg, parse_mode="HTML")
+        return
+
+    try:
+        if not context.args:
+            await update.message.reply_text("📝 <b>Usage Protocol:</b> <code>/Resetstats &lt;User_Id&gt;</code>", parse_mode="HTML")
+            return
+
+        target_uid = int(context.args[0])
+        
+        user_stats[target_uid] = {"coins": 0, "wins": 0, "inventory": []}
+        collection.update_one(
+            {"_id": target_uid},
+            {"$set": {"coins": 0, "wins": 0, "inventory": []}},
+            upsert=True
+        )
+        
+        nuke_msg = (
+            "💣 <b>System Nuke Initiated</b>\n\n"
+            "🚨 <b>Critical Data Purge:</b>\n"
+            f"Administrative Wipe Of Agent <code>{target_uid}</code>.\n\n"
+            "📉 <b>Assets Neutralized:</b>\n"
+            "• 🪙 <b>Coins:</b> <code>Deleted</code>\n"
+            "• 📦 <b>Gears:</b> <code>Incinerated</code>\n\n"
+            "📡 <i>System: Profile Reset To Zero.</i>"
+        )
+        await update.message.reply_text(nuke_msg, parse_mode="HTML")
+
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ <b>Error:</b> <code>{str(e)}</code>", parse_mode="HTML")
+
+async def surrender(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    game = games.get(chat_id)
+
+    if not game or not game.get("active"):
+        await update.message.reply_text("❌ <b>Error: No Active Mission Found!</b>", parse_mode="HTML")
+        return
+
+    current_team = None
+    for team, players in game.get("teams", {}).items():
+        player_ids = [getattr(p, 'id', p) for p in players]
+        if user.id in player_ids:
+            current_team = team
+            break
+
+    if not current_team:
+        await update.message.reply_text("🚫 <b>Denied: Only Active Members Can Surrender!</b>", parse_mode="HTML")
+        return
+
+    spy_obj = game["spymasters"].get(current_team)
+    spy_id = getattr(spy_obj, 'id', spy_obj)
+    
+    if user.id == spy_id:
+        await context.bot.send_message(
+            chat_id=chat_id, 
+            text=f"⚠️ <b>Commander Retreat:</b> Spymaster <b>{user.first_name}</b> Has Ordered Immediate Surrender! 🏳️", 
+            parse_mode="HTML"
+        )
+        await execute_surrender(update, context, chat_id, game, current_team)
+        return
+
+    team_voters = [getattr(p, 'id', p) for p in game["teams"][current_team] if getattr(p, 'id', p) != spy_id]
+    votes_needed = len(team_voters)
+    
+    if votes_needed < 1:
+        await execute_surrender(update, context, chat_id, game, current_team)
+        return
+
+    if game.get("pending_surrender"):
+        await update.message.reply_text("⚠️ <b>Alert: A Surrender Vote Is Already In Progress!</b>", parse_mode="HTML")
+        return
+
+    game["pending_surrender"] = {
+        "team": current_team, 
+        "votes": [user.id], 
+        "needed": votes_needed, 
+        "voters": team_voters
+    }
+
+    keyboard = [[
+        InlineKeyboardButton(f"✅ Confirm (1/{votes_needed})", callback_data="s_yes"),
+        InlineKeyboardButton("❌ Cancel", callback_data="s_no")
+    ]]
+    
+    surrender_msg = (
+        "🏳️ <b>Surrender Protocol</b>\n\n"
+        "⚠️ <b>Retreat Initiated:</b>\n"
+        f"Team <b>{current_team.upper()}</b> Proposes Withdrawal.\n\n"
+        f"📝 <b>Requirement:</b> Need <code>{votes_needed}</code> Votes.\n"
+        "📡 <i>System: Awaiting Tactical Consensus...</i>"
+    )
+    
+    await update.message.reply_text(
+        text=surrender_msg, 
+        reply_markup=InlineKeyboardMarkup(keyboard), 
+        parse_mode="HTML"
+    )
+
+async def handle_surrender_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = query.from_user.id
+    chat_id = query.message.chat_id
+    game = games.get(chat_id)
+
+    if not game or "pending_surrender" not in game:
+        await query.answer("❌ No Active Surrender Vote!", show_alert=True)
+        return
+
+    vote_data = game["pending_surrender"]
+    if user_id not in vote_data["voters"]:
+        await query.answer("🛑 Unauthorized For Your Team!", show_alert=True)
+        return
+
+    if query.data == "s_yes":
+        if user_id not in vote_data["votes"]:
+            vote_data["votes"].append(user_id)
+            await query.answer("✅ Vote Recorded!")
+        else:
+            await query.answer("⚠️ Already Voted!", show_alert=True)
+            return
+    elif query.data == "s_no":
+        game.pop("pending_surrender", None)
+        await query.message.edit_text("❌ <b>Surrender Cancelled: Mission Continues!</b> ⚔️", parse_mode="HTML")
+        return
+
+    if len(vote_data["votes"]) >= vote_data["needed"]:
+        losing_team = vote_data["team"]
+        game.pop("pending_surrender", None)
+        try: 
+            await query.message.delete()
+        except: 
+            pass
+        await execute_surrender(update, context, chat_id, game, losing_team)
+    else:
+        keyboard = [[
+            InlineKeyboardButton(f"✅ Confirm ({len(vote_data['votes'])}/{vote_data['needed']})", callback_data="s_yes"),
+            InlineKeyboardButton("❌ Cancel", callback_data="s_no")
+        ]]
+        try: 
+            await query.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(keyboard))
+        except: 
+            pass
+
+async def execute_surrender(update, context, chat_id, game, losing_team):
+    winner_team = "Congress" if losing_team == "BJP" else "BJP"
+    game["active"] = False
+
+    reward_logs = ""
+    for p in game["teams"][winner_team]:
+        uid = p.id if hasattr(p, 'id') else p
+        reward = 500
+        
+        current_data = collection.find_one({"_id": uid})
+        old_balance = current_data.get("coins", 0) if current_data else 0
+        old_wins = current_data.get("wins", 0) if current_data else 0
+        
+        new_balance = old_balance + reward
+        new_wins = old_wins + 1
+        
+        collection.update_one(
+            {"_id": uid}, 
+            {
+                "$set": {"coins": new_balance}, 
+                "$inc": {"wins": 1}, 
+                "$setOnInsert": {"name": uname(p)}
+            }, 
+            upsert=True
+        )
+        
+        if uid in user_stats:
+            user_stats[uid]["coins"] = new_balance
+            user_stats[uid]["wins"] = user_stats[uid].get("wins", 0) + 1
+        else:
+            user_stats[uid] = {"coins": new_balance, "wins": 1, "name": uname(p)}
+
+        status = "Bank Debt Paid" if old_balance < 0 else "Credit Credited"
+        reward_logs += f"• 👤 <b>{uname(p)[:12]}</b> | {status} | 🏆 Wins: {new_wins}\n"
+
+    msg = (
+        "🏳️ <b>Mission Terminated: Surrender</b>\n\n"
+        "🚨 <b>Surrender Protocol Activated!</b>\n\n"
+        f"The <b>Team {losing_team.upper()}</b> Has Officially Raised The \n"
+        "White Flag. Tactical Resistance Has Ceased, \n"
+        "And All Battlefield Assets Have Been Handed \n"
+        "Over To The Victors.\n\n"
+        f"🏆 <b>Dominant Force:</b> Team <b>{winner_team.upper()}</b>\n\n"
+        "📜 <b>War Spoils And Reward Debrief:</b>\n"
+        f"🎖️ <b>Campaign Status:</b> Victory By Surrender\n"
+        "💰 <b>War Bounty:</b> 🪙 <code>500</code> Coins Transferred\n"
+        f"📡 <b>Sector Status:</b> Secured By {winner_team.upper()}\n\n"
+        "👥 <b>Reward Distribution Logs:</b>\n"
+        f"{reward_logs}\n"
+        "📡 <i>All Funds Successfully Synced To Vault.</i>\n\n"
+        "📢 <b>Central Command Advisory:</b>\n"
+        "<i>Surrender Is The Ultimate Admission Of \n"
+        f"Defeat. Team {winner_team.upper()} Has Proven Their \n"
+        "Strategic Superiority Without Firing The \n"
+        "Final Shot. History Honors The Victors.</i>\n\n"
+        "👑 <b>Long Live The Supreme Squad!</b>\n"
+        f"🛰️ <b>Sector Id:</b> <code>Sec_{chat_id}</code>\n"
+        "🧩 <b>Map Status:</b> Archived\n"
+        "📡 <b>Data:</b> Syncing Global Standings...\n\n"
+        "🎮 <i>System: Operations Terminated. Standing By.</i>"
+    )
+
+    await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML")
+
+    try:
+        await send_winner_image(context, chat_id, winner_team)
+    except Exception as e:
+        print(f"Surrender Image Error: {e}")
+
+async def punishment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    allowed_admin = "bhawanisinghshekhawatt" 
+    if not update.effective_user.username or update.effective_user.username.lower() != allowed_admin.lower():
+        return
+    
+    try:
+        target_input = context.args[0].replace("@", "")
+        reason = " ".join(context.args[1:]) if len(context.args) > 1 else "Violation Of Protocol"
+        target_id = int(target_input) if target_input.isdigit() else next((u for u, s in user_stats.items() if s.get("username", "").lower() == target_input.lower()), None)
+
+        if not target_id:
+            await update.message.reply_text("❌ <b>Error: Agent Not Found!</b>", parse_mode="HTML")
+            return
+
+        user_stats[target_id]["coins"] -= 5000
+        collection.update_one({"_id": int(target_id)}, {"$set": {"coins": user_stats[target_id]["coins"]}}, upsert=True)
+
+        punish_msg = (
+            "⚖️ <b>Judicial Sentence</b>\n\n"
+            f"👤 <b>Agent:</b> <code>{target_id}</code>\n"
+            f"⚠️ <b>Offense:</b> <i>{reason}</i>\n"
+            "🔻 <b>Penalty:</b> <code>-5000</code> Coins\n\n"
+            "📡 <i>System: Logged In Permanent Archive.</i>"
+        )
+        await update.message.reply_text(punish_msg, parse_mode="HTML")
+    except:
+        await update.message.reply_text("📝 <b>Usage Protocol:</b> <code>/Punishment &lt;Id&gt; &lt;Reason&gt;</code>", parse_mode="HTML")
+
+async def hint(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    game = games.get(chat_id)
+    
+    if not game or not game.get("active"):
+        await context.bot.send_message(
+            chat_id=chat_id, 
+            text="❌ <b>Unavailable: No Active Mission Found In This Sector.</b>", 
+            parse_mode="HTML"
+        )
+        return
+
+    active_team = game.get("turn", "Unknown")
+    team_name = str(active_team).upper() if active_team else "UNKNOWN"
+    
+    raw_clue = game.get("clue")
+    if raw_clue is None:
+        clue_display = "Awaiting Transmission"
+    else:
+        clue_display = str(raw_clue).upper()
+    
+    strikes = game.get("left", 0)
+    
+    hint_msg = (
+        "📊 <b>Tactical Briefing</b>\n\n"
+        f"🚩 <b>Active Team:</b> <b>{team_name}</b>\n"
+        f"🗝️ <b>Current Clue:</b> <code>{clue_display}</code>\n"
+        f"🎯 <b>Strikes Left:</b> <code>{strikes}</code>\n\n"
+        "📡 <i>System: Scanning For Enemy Frequencies...</i>\n"
+        "🫡 <i>Advisory: Stay Sharp, Agents.</i>"
+    )
+
+    try:
+        await context.bot.send_message(
+            chat_id=chat_id, 
+            text=hint_msg, 
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        print(f"Hint Error: {e}")
+
+async def quarantine(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    game = games.get(chat_id)
+    
+    if not game or not game.get("active"):
+        return
+
+    user = update.effective_user
+    is_creator = user.id == game.get("creator")
+
+    if not is_creator:
+        return
+
+    try:
+        if len(context.args) < 1:
+            await update.message.reply_html("📝 <b>Usage Protocol:</b> <code>/Quarantine &lt;Bjp/Congress&gt; [Reason]</code>")
+            return
+            
+        target_team = context.args[0].upper()
+        reason = " ".join(context.args[1:]) if len(context.args) > 1 else "Violation Of Field Protocols"
+        
+        if target_team not in ["BJP", "CONGRESS"]:
+            await update.message.reply_text("❌ <b>Invalid Team:</b> Please Use Bjp Or Congress.")
+            return
+        
+        game["quarantine_team"] = target_team
+        game["quarantine_turns"] = 2
+        game["quarantine_reason"] = reason
+        
+        enemy_team = "Congress" if target_team == "BJP" else "BJP"
+        game["turn"] = enemy_team
+        game["clue"] = None
+        game["left"] = 0
+        
+        msg = (
+            "⚠️ <b>Protocol Omega: Active</b>\n\n"
+            f"🚨 <b>Quarantine Initiated:</b> Team <b>{target_team}</b>\n"
+            f"⚖️ <b>Reason:</b> <i>{reason}</i>\n"
+            "⏳ <b>Duration:</b> 2 Full Tactical Cycles\n\n"
+            "🚫 <b>Restriction:</b> All Communications Intercepted. \n"
+            f"Control Transferred To Team <b>{enemy_team.upper()}</b>.\n\n"
+            "📡 <i>System: Bridge Blocked. No Signals Out.</i>"
+        )
+        await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML")
+
+    except Exception as e:
+        print(f"Quarantine Error: {e}")
+
+async def spymaster_mute_filter(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_chat or not update.effective_user:
+        return
+      
+    message = update.effective_message
+    if not message or not message.text:
+        return
+      
+    chat_id = update.effective_chat.id
+    game = games.get(chat_id)
+    
+    if not game or not game.get("active"):
+        return
+      
+    user_id = update.effective_user.id
+    
+    all_spymasters = []
+    for team in ["BJP", "Congress"]:
+        spy_obj = game.get("spymasters", {}).get(team)
+        if spy_obj:
+            sid = spy_obj.id if hasattr(spy_obj, 'id') else spy_obj
+            all_spymasters.append(sid)
+            
+    if user_id in all_spymasters:
+        text = message.text.strip().lower().split()[0]
+        
+        ONLY_ALLOWED = ['/surrender', '/cancel', '/ready', '/team', '/hint', '/clue', '/adduser', '/removeuser', '/changespy', '/shuffle', '/leave', '/turn', '/quarantine', '/lmao', '/fak', '/dena', '/suicide', '/right', '/wrong', '/black']
+
+        if text not in ONLY_ALLOWED:
+            try:
+                await message.delete()
+                raise ApplicationHandlerStop 
+            except Exception:
+                pass 
+            return
+
+async def stop_spymaster_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    reaction_update = update.message_reaction
+    if not reaction_update or not reaction_update.new_reaction:
+        return
+      
+    chat_id = reaction_update.chat.id
+    game = games.get(chat_id)
+    if not game or not game.get("active"):
+        return
+      
+    user = reaction_update.user
+    if not user: return
+  
+    current_team = None
+    for team, spy_obj in game.get("spymasters", {}).items():
+        sid = getattr(spy_obj, 'id', spy_obj)
+        if sid == user.id:
+            current_team = team
+            break
+          
+    if current_team:
+        if "spy_warnings" not in game: game["spy_warnings"] = {}
+        if "quarantine_history" not in game: game["quarantine_history"] = {}
+        
+        uid_str = str(user.id)
+        warn_count = game["spy_warnings"].get(uid_str, 0) + 1
+        game["spy_warnings"][uid_str] = warn_count
+        
+        try:
+            if warn_count < 3:
+                warn_text = (
+                    f"⚠️ <b>Reaction Warning ({warn_count}/3)</b>\n\n"
+                    "🚨 <b>Strategic Violation:</b>\n"
+                    f"Spymaster <b>{user.first_name}</b>, Reactions Are Forbidden!\n\n"
+                    f"🚩 <b>Strikes:</b> <code>{warn_count}</code>\n"
+                    "⚠️ <i>System: 3 Strikes Will Trigger Team Quarantine.</i>"
+                )
+                await context.bot.send_message(chat_id=chat_id, text=warn_text, parse_mode="HTML")
+            
+            else:
+                game["spy_warnings"][uid_str] = 0 
+                q_count = game["quarantine_history"].get(uid_str, 0) + 1
+                game["quarantine_history"][uid_str] = q_count
+                
+                penalty_turns = q_count 
+                
+                game["quarantine_team"] = current_team.upper()
+                game["quarantine_turns"] = penalty_turns
+                game["quarantine_reason"] = f"Reaction Abuse Level {q_count}"
+                
+                q_text = (
+                    "🚫 <b>Severe Quarantine</b>\n\n"
+                    "🚨 <b>Max Strikes Reached!</b>\n"
+                    f"Team <b>{current_team.upper()}</b> Has Been Locked Out.\n\n"
+                    f"⏳ <b>Duration:</b> <code>{penalty_turns}</code> Turns Skip.\n"
+                    f"⚖️ <b>Reason:</b> Level {q_count} Reaction Abuse.\n\n"
+                    "📡 <i>System: Strategic Lock Engaged.</i>"
+                )
+                await context.bot.send_message(chat_id=chat_id, text=q_text, parse_mode="HTML")
+
+                game["turn"] = "Congress" if current_team.upper() == "BJP" else "BJP"
+                game["clue"] = None
+                game["left"] = 0
+                
+        except Exception as e:
+            print(f"Reaction System Error: {e}")
+
+async def leave(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    user = update.effective_user
+    game = games.get(chat_id)
+
+    if not game or not game.get("active"):
+        await update.message.reply_text("❌ <b>Error:</b> No Active Mission Found.", parse_mode="HTML")
+        return
+
+    if user.id not in game["players"]:
+        await update.message.reply_text("🚨 <b>Denied:</b> You Are Not In This Game.", parse_mode="HTML")
+        return
+
+    bjp_spy = game["spymasters"].get("BJP")
+    con_spy = game["spymasters"].get("Congress")
+    b_id = bjp_spy.id if hasattr(bjp_spy, 'id') else bjp_spy
+    c_id = con_spy.id if hasattr(con_spy, 'id') else con_spy
+    
+    is_spymaster = (user.id == b_id or user.id == c_id)
+
+    penalty_msg = ""
+    if game.get("started"):
+        penalty_amount = 50
+        try:
+            current_data = collection.find_one({"_id": user.id})
+            if current_data:
+                new_bal = current_data.get("coins", 0) - penalty_amount
+                collection.update_one({"_id": user.id}, {"$set": {"coins": new_bal}})
+                if user.id in user_stats:
+                    user_stats[user.id]["coins"] = new_bal
+                penalty_msg = f"\n💰 <b>Penalty:</b> 🪙 <code>50</code> Coins Deducted For Desertion!"
+        except Exception as e:
+            print(f"Penalty Error: {e}")
+
+    if is_spymaster:
+        game["active"] = False
+        abort_msg = (
+            "⚠️ <b>Mission Aborted</b>\n\n"
+            f"🚨 <b>Critical:</b> Spymaster <b>{uname(user)}</b> Has Deserted!{penalty_msg}\n\n"
+            "📡 <i>System: High Command Collapsed. Mission Terminated.</i>"
+        )
+        await update.message.reply_text(abort_msg, parse_mode="HTML")
+        return
+
+    for t_name in ["BJP", "Congress"]:
+        game["teams"][t_name] = [p for p in game["teams"][t_name] if (p.id if hasattr(p, 'id') else p) != user.id]
+    
+    if user.id in game["players"]:
+        if isinstance(game["players"], dict):
+            del game["players"][user.id]
+        else:
+            game["players"].remove(user.id)
+
+    exit_msg = (
+        "🏃 <b>Agent Exfiltrated</b>\n\n"
+        f"👤 <b>Agent:</b> {uname(user)}{penalty_msg}\n\n"
+        "📡 <i>System: Operation Continues With Remaining Units.</i>"
+    )
+    await update.message.reply_text(exit_msg, parse_mode="HTML")
+
+    if game.get("started"):
+        bjp_field = [p for p in game["teams"]["BJP"] if (p.id if hasattr(p, 'id') else p) != b_id]
+        con_field = [p for p in game["teams"]["Congress"] if (p.id if hasattr(p, 'id') else p) != c_id]
+        
+        if not bjp_field or not con_field:
+            game["active"] = False
+            await update.message.reply_text("🚨 <b>Terminated:</b> Team Depleted. Mission Closed.", parse_mode="HTML")
+
+async def get_file_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type == "private":
+        file_id = None
+        media_type = ""
+        
+        if update.message.sticker:
+            file_id = update.message.sticker.file_id
+            media_type = "STICKER"
+            
+        elif update.message.animation:
+            file_id = update.message.animation.file_id
+            media_type = "GIF"
+            
+        elif update.message.video:
+            file_id = update.message.video.file_id
+            media_type = "VIDEO"
+
+        if file_id:
+            msg = (
+                f"<code>┏━━━━━━━━━━━━━━━━━━━━━━━━━━━┓</code>\n"
+                f"<code>      📁 MEDIA FILE ID LOGGED       </code>\n"
+                f"<code>┗━━━━━━━━━━━━━━━━━━━━━━━━━━━┛</code>\n\n"
+                f"📌 <b>TYPE:</b> {media_type}\n"
+                f"🔑 <b>FILE ID:</b>\n<code>{file_id}</code>\n\n"
+                f"📡 <i>System: Data extracted successfully.</i>"
+            )
+            await update.message.reply_text(msg, parse_mode="HTML")
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    help_text = (
+        "🎮 <b>Commands Center Menu</b>\n\n"
+        "🛰️ <b>Squad Operations (Lobby):</b>\n"
+        "• <code>/Startgame</code> — Initiate A War Lobby\n"
+        "• <code>/Join</code> — Enter The Frontlines\n"
+        "• <code>/Players</code> — Inspect Squad Status\n"
+        "• <code>/Team</code> — Current Team Formations\n"
+        "• <code>/Changeteam</code> — Swap Your Faction\n"
+        "• <code>/Leave</code> — Leave In The Mid Game\n\n"
+        
+        "⚙️ <b>Command And Control (Creator):</b>\n"
+        "• <code>/Start</code> — Launch The Operation\n"
+        "• <code>/Ready</code> — Deploy Intel Board To Spymasters\n"
+        "• <code>/Shuffle</code> — Reshuffle Team Units\n"
+        "• <code>/Cancel</code> — Terminate The War\n"
+        "• <code>/Adddummy</code> — Deploy Ai Dummy Agents\n"
+        "• <code>/Kick</code> | <code>/Adduser</code> | <code>/Removeuser</code>\n"
+        "• <code>/Changespy</code> | <code>/Resend</code>\n"
+        "• <code>/Timerspy</code> | <code>/Timerplayer</code> — Set Limits\n\n"
+
+        "⚔️ <b>Battlefield Actions:</b>\n"
+        "• <code>/Clue</code> — Spymaster Intel Transmission (Dm)\n"
+        "• <code>/Guess &lt;Word&gt;</code> — Execute A Tactical Strike\n"
+        "• <code>/Hint</code> — View Current Intel Report\n"
+        "• <code>/Turn</code> — Check Active Control Team\n"
+        "• <code>/Endturn</code> — Conclude Current Mission\n"
+        "• <code>/Ask &lt;Word&gt;</code> — Access Gemini Ai Database\n"
+        "• <code>/Surrender</code> — Initiate Retreat Protocol\n\n"
+
+        "💰 <b>Economy And Arsenal:</b>\n"
+        "• <code>/Profile</code> — View Service Record And Coins\n"
+        "• <code>/Shop</code> — Access The Tactical Depot\n"
+        "• <code>/Buy &lt;Id&gt;</code> — Purchase Strategic Gear\n"
+        "• <code>/Inventory</code> — Inspect Owned Items\n"
+        "• <code>/Use &lt;Id&gt;</code> — Activate Gear In Mission\n"
+        "• <code>/Leaderboard</code> — Global Agent Rankings\n\n"
+
+        "📑 <b>Misc Protocols:</b>\n"
+        "• <code>/Guide</code> — Official Mission Manual\n"
+        "• <code>/Fak</code> | <code>/Lmao</code> — Tactical Banter\n\n"
+        "🫡 <b>Advisory:</b> Select A Protocol To Proceed.\n"
+        "📡 <i>System: Link Stable. Awaiting Input...</i>"
+    )
+
+    await update.message.reply_text(
+        text=help_text, 
+        parse_mode="HTML"
+    )
+
+# ---------------- Run ----------------
+
+app = ApplicationBuilder().token(TOKEN).connect_timeout(40).read_timeout(40).write_timeout(40).pool_timeout(40).build()
+
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, spymaster_mute_filter), group=-1)
+app.add_handler(MessageReactionHandler(stop_spymaster_reaction))
+app.add_handler(MessageHandler(filters.Sticker.ALL | filters.ANIMATION | filters.VIDEO, get_file_id))
+app.add_handler(CallbackQueryHandler(broadcast_callback, pattern="^bc_"))
+app.add_handler(MessageHandler(filters.COMMAND, spymaster_mute_filter), group=-1)
+app.add_handler(MessageHandler(filters.Sticker.ALL, handle_stickers))
+app.add_handler(MessageHandler(filters.ANIMATION, block_spams))
+app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_links), group=1)
+app.add_handler(CommandHandler("hint", hint))
+app.add_handler(CommandHandler("quarantine", quarantine))
+app.add_handler(CommandHandler("punishment", punishment))
+app.add_handler(CallbackQueryHandler(handle_endturn_callback, pattern="^e_"))
+app.add_handler(CallbackQueryHandler(handle_surrender_callback, pattern="^s_"))
+app.add_handler(CommandHandler("help", help_command))
+app.add_handler(CallbackQueryHandler(handle_vote, pattern="^v_"))
+app.add_handler(CommandHandler("leave", leave))
+app.add_handler(CommandHandler("startgame", startgame))
+app.add_handler(CommandHandler("join", join))
+app.add_handler(CommandHandler("adddummy", add_dummy))
+app.add_handler(CommandHandler("players", players))
+app.add_handler(CommandHandler("start", start))
+app.add_handler(CommandHandler("shuffle", shuffle))
+app.add_handler(CommandHandler("wrong", wrong))
+app.add_handler(CommandHandler("right", right))
+app.add_handler(CommandHandler("clue", clue))
+app.add_handler(CommandHandler("ready", ready))
+app.add_handler(CommandHandler("broadcast", broadcast))
+app.add_handler(CommandHandler("guess", guess))
+app.add_handler(CommandHandler("endturn", endturn))
+app.add_handler(CommandHandler("turn", turn))
+app.add_handler(CommandHandler("guide", guide))
+app.add_handler(CommandHandler("cancel", cancel))
+app.add_handler(CommandHandler("adduser", add_user))
+app.add_handler(CommandHandler("removeuser", remove_user))
+app.add_handler(CommandHandler("changespy", changespy))
+app.add_handler(CommandHandler("changeteam", changeteam))
+app.add_handler(CommandHandler("ask", ask))
+app.add_handler(CommandHandler("timerspy", timerspy))
+app.add_handler(CommandHandler("timerplayer", timerplayer))
+app.add_handler(CommandHandler("resend", resend))
+app.add_handler(CommandHandler("fak", fak))
+app.add_handler(CommandHandler("lmao", lmao))
+app.add_handler(CommandHandler("suicide", suicide))
+app.add_handler(CommandHandler("dena", dena))
+app.add_handler(CommandHandler("black", black))
+app.add_handler(CommandHandler("remove", kick))
+app.add_handler(CommandHandler("resetstats", resetstats))
+app.add_handler(CommandHandler("leaderboard", leaderboard))
+app.add_handler(CommandHandler("inventory", inventory))
+app.add_handler(CommandHandler("use", use))
+app.add_handler(CommandHandler("shop", shop))
+app.add_handler(CommandHandler("buy", buy))
+app.add_handler(CommandHandler("surrender", surrender))
+app.add_handler(CommandHandler("profile", profile))
+app.add_handler(CommandHandler("team", team_status))
+app.add_handler(CommandHandler("givecoins", givecoins))
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, guess))
+
+print("Codenames Bot Is Live 📡")
+app.run_polling(
+    drop_pending_updates=True, 
+    allowed_updates=["message", "callback_query", "message_reaction"]
+)
